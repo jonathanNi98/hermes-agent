@@ -295,8 +295,36 @@ class AIAgent:
     """
     AI Agent with tool calling capabilities.
 
-    This class manages the conversation flow, tool execution, and response handling
-    for AI models that support function calling.
+    AIAgent 是 Hermes Agent 的核心入口类，负责：
+    1. 管理对话生命周期（通过 run_conversation）
+    2. 编排工具调用循环
+    3. 协调记忆、Provider、Context Engine 等组件
+
+    初始化：__init__ 是 thin forwarder，真正初始化在 agent.agent_init.init_agent()
+    启动对话：调用 run_conversation() → conversation_loop.run_conversation()
+
+    Attributes (由 init_agent 填充):
+        model: str                      # 模型名称，如 "claude-3-5-sonnet"
+        provider: str                   # Provider 名称，如 "anthropic"
+        base_url: str                  # API 端点
+        _memory_manager: MemoryManager # 记忆管理器
+        _session_db: SessionDB         # SQLite 状态持久化
+        context_compressor: ContextEngine  # 上下文压缩引擎
+        tools: List[dict]             # 已注册的工个 schema
+
+    Entry Points:
+        run_conversation(user_message) -> str
+            ├── 转发到 agent.conversation_loop.run_conversation()
+            └── 返回最终文本响应（无 tool_calls 时）
+
+    Examples:
+        >>> agent = AIAgent(
+        ...     model="claude-3-5-sonnet",
+        ...     provider="anthropic",
+        ...     base_url="https://api.anthropic.com"
+        ... )
+        >>> response = agent.run_conversation("Hello!")
+        >>> print(response)
     """
 
     _TOOL_CALL_ARGUMENTS_CORRUPTION_MARKER = (
@@ -316,23 +344,23 @@ class AIAgent:
 
     def __init__(
         self,
-        base_url: str = None,
-        api_key: str = None,
-        provider: str = None,
+        base_url: str = None,              # API 端点，如 "https://api.anthropic.com"
+        api_key: str = None,               # API 密钥
+        provider: str = None,               # Provider 名称："anthropic" | "openai" | "gemini"
         api_mode: str = None,
         acp_command: str = None,
         acp_args: list[str] | None = None,
         command: str = None,
         args: list[str] | None = None,
-        model: str = "",
-        max_iterations: int = 90,  # Default tool-calling iterations (shared with subagents)
+        model: str = "",                   # 模型名称，如 "claude-3-5-sonnet-20250514"
+        max_iterations: int = 90,          # 单次对话最大工具调用次数，防止死循环
         tool_delay: float = 1.0,
-        enabled_toolsets: List[str] = None,
-        disabled_toolsets: List[str] = None,
+        enabled_toolsets: List[str] = None,   # 启用的工具集，如 ["file", "terminal"]
+        disabled_toolsets: List[str] = None,   # 禁用的工具集
         save_trajectories: bool = False,
-        verbose_logging: bool = False,
+        verbose_logging: bool = False,         # 开启详细日志
         quiet_mode: bool = False,
-        ephemeral_system_prompt: str = None,
+        ephemeral_system_prompt: str = None,    # 临时 system prompt
         log_prefix_chars: int = 100,
         log_prefix: str = "",
         providers_allowed: List[str] = None,
@@ -342,25 +370,25 @@ class AIAgent:
         provider_require_parameters: bool = False,
         provider_data_collection: str = None,
         openrouter_min_coding_score: Optional[float] = None,
-        session_id: str = None,
-        tool_progress_callback: callable = None,
-        tool_start_callback: callable = None,
-        tool_complete_callback: callable = None,
-        thinking_callback: callable = None,
-        reasoning_callback: callable = None,
-        clarify_callback: callable = None,
-        step_callback: callable = None,
-        stream_delta_callback: callable = None,
-        interim_assistant_callback: callable = None,
-        tool_gen_callback: callable = None,
-        status_callback: callable = None,
-        max_tokens: int = None,
+        session_id: str = None,              # 会话 ID，用于记忆和状态持久化
+        tool_progress_callback: callable = None,   # 工具进度回调
+        tool_start_callback: callable = None,      # 工具开始回调
+        tool_complete_callback: callable = None,    # 工具完成回调
+        thinking_callback: callable = None,        # thinking 回调
+        reasoning_callback: callable = None,        # reasoning 回调
+        clarify_callback: callable = None,          # 澄清回调
+        step_callback: callable = None,             # step 回调
+        stream_delta_callback: callable = None,      # 流式 delta 回调
+        interim_assistant_callback: callable = None,  # 中间响应回调
+        tool_gen_callback: callable = None,         # 工具生成回调
+        status_callback: callable = None,            # 状态回调
+        max_tokens: int = None,                   # 模型最大输出 token
         reasoning_config: Dict[str, Any] = None,
         service_tier: str = None,
         request_overrides: Dict[str, Any] = None,
         prefill_messages: List[Dict[str, Any]] = None,
-        platform: str = None,
-        user_id: str = None,
+        platform: str = None,                      # 平台标识
+        user_id: str = None,                       # 用户 ID
         user_id_alt: str = None,
         user_name: str = None,
         chat_id: str = None,
@@ -368,21 +396,28 @@ class AIAgent:
         chat_type: str = None,
         thread_id: str = None,
         gateway_session_key: str = None,
-        skip_context_files: bool = False,
-        load_soul_identity: bool = False,
-        skip_memory: bool = False,
-        session_db=None,
-        parent_session_id: str = None,
-        iteration_budget: "IterationBudget" = None,
-        fallback_model: Dict[str, Any] = None,
+        skip_context_files: bool = False,          # 跳过上下文文件加载
+        load_soul_identity: bool = False,          # 加载 SOUL.md 身份
+        skip_memory: bool = False,                  # 跳过记忆功能
+        session_db=None,                            # 外部传入的 SessionDB
+        parent_session_id: str = None,              # 父会话 ID（用于子代理）
+        iteration_budget: "IterationBudget" = None,  # 迭代预算控制
+        fallback_model: Dict[str, Any] = None,      # fallback 模型配置
         credential_pool=None,
-        checkpoints_enabled: bool = False,
+        checkpoints_enabled: bool = False,          # 开启检查点
         checkpoint_max_snapshots: int = 20,
         checkpoint_max_total_size_mb: int = 500,
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
     ):
-        """Forwarder — see ``agent.agent_init.init_agent``."""
+        """
+        Thin forwarder — 实际初始化逻辑在 agent.agent_init.init_agent()。
+
+        为什么用 forwarder 模式？
+        1. 保持 run_agent.py 作为稳定 API
+        2. 方便测试 patch init_agent
+        3. 初始化逻辑庞大，单独放在 agent_init.py 更易维护
+        """
         from agent.agent_init import init_agent
         init_agent(
             self,

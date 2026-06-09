@@ -6,6 +6,228 @@
 
 ---
 
+## 📌 第 0 部分:Prompt 构建全貌(★ 概览,后补)
+
+> **目的**:在深入 `build_messages` 之前,先建立完整 Prompt 由哪几块组成的整体认知。
+> **创建日期**:2026-06-10(回补)
+> **本节定位**:全景图,具体细节见各对应笔记。
+
+### 一句话
+
+**完整 Prompt = System Prompt(三层架构)+ Tools(工具 schema)+ Few-shot(prefill,可选)+ Messages(对话历史)**。**你已经学过的笔记 1/2 主要覆盖 ①④ 两块**;**② Tools 跟 Day 4 的 adapter 设计强相关,值得连着学**;**③ Few-shot 在生产环境也常用**。
+
+### 4 大块组成
+
+```
+┌─────────────────────────────────────────────────────┐
+│ ① System Prompt(系统提示)                            │
+│    三层架构:stable + context + volatile             │
+│    ← 笔记 2 重点学的,占 prompt 绝大部分 token         │
+├─────────────────────────────────────────────────────┤
+│ ② Few-shot Examples(预填示例)                        │
+│    prefill_messages / Anthropic prefill             │
+│    ← 笔记 1 提过"行 990-988"                        │
+├─────────────────────────────────────────────────────┤
+│ ③ Tools(工具 schema)                                │
+│    工具定义列表(每个工具的 name/description/params) │
+│    ← Anthropic / OpenAI 不同格式                    │
+├─────────────────────────────────────────────────────┤
+│ ④ Messages(对话历史)                                │
+│    system + user + assistant + tool 角色交替        │
+│    ← build_messages 构造,笔记 1 重点学的             │
+└─────────────────────────────────────────────────────┘
+```
+
+**注意顺序**:1/2/3 是**静态/少变**的,4 是**动态**的。**不同 LLM 看到的 1/2/3 一样,4 随对话变**。
+
+### 4 大块详解
+
+#### ① System Prompt(你已经学过的)
+
+**笔记 2 重点**:三层架构
+
+```
+第 1 层:Stable(整个 agent 生命周期不变)
+  - SOUL.md
+  - 工具使用指南
+  - 平台提示
+
+第 2 层:Context(同一 session 不变)
+  - AGENTS.md / .cursorrules / .hermes.md
+  - 持久记忆(MEMORY.md / USER.md)
+
+第 3 层:Volatile(每天都变)
+  - timestamp("今天 2026-06-08")
+  - session info
+```
+
+**核心思想**:**变化越频繁的内容越靠后**。这样 LLM 的 KV cache 命中率↑。
+
+#### ② Few-shot Examples(预填示例)⭐ 新内容
+
+**是什么**:在 messages 开头插入**示例对话**,引导 LLM 模仿格式/风格。
+
+**两种形式**:
+
+```python
+# 形式 A:prefill_messages(Anthropic 风格,塞在 user/assistant 之前)
+agent.prefill_messages = [
+    {"role": "user", "content": "列出 1+1"},
+    {"role": "assistant", "content": "1+1 = 2"},  # ← LLM 接着写
+]
+
+# 形式 B:tool_use 预填(OpenAI/Anthropic 通用)
+# LLM 看到示例 tool_call 怎么写,然后模仿
+```
+
+**笔记 1 第 21 行**:`990-988 Prefill messages 注入 | agent.prefill_messages | few-shot priming(API 调用时专用)`
+
+**用途举例**:
+- 教 LLM 用特定工具格式
+- 引导 LLM 用特定语气
+- 演示复杂任务的输出格式
+
+#### ③ Tools(工具 schema)⭐ 新内容
+
+**是什么**:LLM 看到的"我能调哪些工具"的清单。
+
+**典型格式**(Anthropic):
+```json
+{
+  "tools": [
+    {
+      "name": "read_file",
+      "description": "Read a file from the filesystem",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {"type": "string", "description": "File path"},
+          "start_line": {"type": "integer", "description": "Start line (0-indexed)"}
+        },
+        "required": ["path"]
+      }
+    },
+    {
+      "name": "write_file",
+      "description": "Write content to a file",
+      "input_schema": {...}
+    }
+    // ... 可能几十个工具
+  ]
+}
+```
+
+**关键设计**:
+- **每个 provider 格式不同**(Anthropic `input_schema` / OpenAI `function.parameters`)
+- **adapter 负责转换**(Day 4 要学的)
+- **description 很重要** — LLM 靠它决定**用哪个工具**
+- **可能 1K-5K tokens** — 工具多的话占 prompt 很大一块
+
+#### ④ Messages(对话历史,笔记 1 重点学的)
+
+**笔记 1 重点**:`build_messages()` 构造的内部 messages → API 格式
+
+**典型结构**:
+```python
+[
+    {"role": "system", "content": "...三层架构的 system prompt..."},  # ①
+    {"role": "user", "content": "在 test.py 写 hello world"},
+    {"role": "assistant", "content": "好的", "tool_calls": [...]},
+    {"role": "tool", "tool_call_id": "abc", "content": "Successfully wrote 42 bytes"},
+    {"role": "user", "content": "再加个时间戳"},
+    # ...
+]
+```
+
+**核心操作**:
+- **角色交替修复**(`_repair_message_sequence`)
+- **tool args 修复**(`_sanitize_tool_call_arguments`)
+- **多模态内容处理**(图像、文档)
+- **压缩**(`_prune_old_tool_results` + `compress()`)— 这两周学的
+
+### 完整 Prompt 流向
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Hermes Agent 构造完整 Prompt 的流程                          │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│ ① System Prompt  ← system_prompt.py 三层架构拼装            │
+│                                                             │
+│ ② Tools           ← get_tool_schemas() 生成工具 schema 列表 │
+│                     (走 _format_tools_for_provider 适配)   │
+│                                                             │
+│ ③ Few-shot        ← agent.prefill_messages(可选)          │
+│                                                             │
+│ ④ Messages        ← build_messages() 构造对话历史           │
+│                     ├─ 工具参数预修复                       │
+│                     ├─ Role 交替修复                        │
+│                     ├─ 注入 system + memory                 │
+│                     ├─ 主动 surrogate 清洗                  │
+│                     └─ Anthropic cache_control 注入         │
+│                                                             │
+│ ⑤ 一起发给 Provider → 调 LLM                               │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 4 大块的 token 占比(典型会话)
+
+| 块 | 占比 | 变化频率 |
+|---|---|---|
+| ① System Prompt | 30-50% | 慢变(几小时-几天) |
+| ② Tools | 10-30% | 极慢(agent 启动后不变) |
+| ③ Few-shot | 0-10% | 极慢 |
+| ④ Messages | 20-50% | 快变(每轮对话都变) |
+
+**注意 ①②③ 的 cache 价值远大于 ④** — 它们变化慢,KV cache 命中率高,降本巨大。
+
+### 缓存策略(Anthropic 特有的优化)
+
+笔记 1 第 22 行提过:
+```
+1002-1007 | Anthropic cache_control | apply_anthropic_cache_control(...)
+```
+
+**Anthropic 的 prompt caching**:
+- 在 prompt 关键点打 `cache_control: {"type": "ephemeral"}`
+- 后续请求**前缀不变**的部分直接命中 cache,降本 ~75%
+
+**Hermes 的打点策略**:
+```
+[system 末尾]   ← cache 1
+[...对话...]
+[最后 3 条]    ← cache 2(对话增量)
+```
+
+**关键洞察**:**System + Tools + Few-shot 通常稳定**,可以打 cache 断点;**Messages 的最后几条可能增量变**,也可以打 cache 断点。
+
+### 跟你之前学过的对应关系
+
+| 笔记 | 学的内容 | 对应 Prompt 块 |
+|---|---|---|
+| 笔记 1 | `build_messages` 构造 API 请求 | **④ Messages** |
+| 笔记 2 第一/二/九/十/十一/十二部分 | 三层架构 + 各小节细节 | **① System Prompt** |
+| 笔记 2 第四部分 | `prompt_builder.py` 的角色 | **①② 拼装逻辑** |
+| 笔记 2 第十三/十四/十五部分 | `compress()` + `_generate_summary` | **④ Messages 压缩** |
+| **没学过的** | `prefill_messages` 怎么用 | **③ Few-shot** |
+| **没学过的** | 工具 schema 怎么生成 | **② Tools** |
+
+### 建议补学的两块
+
+| 主题 | 文件 | 价值 |
+|---|---|---|
+| **Few-shot / Prefill** | 笔记 1 第 21 行(`990-988`) | 学会怎么"教"LLM 特定格式 |
+| **Tools Schema** | `get_tool_schemas()` + `format_tools_for_provider` | 学会怎么管理几十个工具 |
+
+**Tools 那块最值得看** — 它跟 Day 4 的 Runtime Provider 高度相关(每个 provider 工具格式不同,adapter 转换)。
+
+### 一句话总结
+
+> **完整 Prompt = System Prompt(三层架构)+ Tools(几十个工具 schema)+ Few-shot(prefill,可选)+ Messages(对话历史)**。**你已经学过了 ①④ 两块,②③ 是 Day 3 没覆盖、但生产环境必备的**。**② Tools 跟 Day 4 的 adapter 设计强相关,值得连着学**。
+
+---
+
 ## 📌 第一个点:`build_messages` 的精确行号拆解
 
 `build_messages` 不是一个独立函数,而是**嵌在 `run_conversation` 主循环体里**的一个连续代码段,行号范围 **[814, 1136]**,共 **322 行**。它负责把内部 `messages` 列表转换成发往 LLM 的 `api_messages` 数组。

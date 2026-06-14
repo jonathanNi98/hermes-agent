@@ -2,6 +2,26 @@
 """
 Memory Tool Module - Persistent Curated Memory
 
+# 1.1 这是干什么的
+# "内置 memory"——agent 自己的"长期记忆",落盘到文件
+# 两个 markdown 文件:
+#   * MEMORY.md — agent 的个人笔记(环境事实 / 项目约定 / 工具怪癖)
+#   * USER.md   — 对用户的认知(偏好 / 沟通风格 / 期望)
+#
+# 1.2 关键设计:Frozen Snapshot
+# session 启动时一次性把两个 md 读出来,**冻结**成 system prompt 的一部分
+# session 中途写入只更新磁盘,**不**刷新 system prompt
+# 为什么?—— 保护 prefix cache(LLM 看到 system prompt 没变,缓存就还在)
+# 下次 session 启动时才读新内容
+#
+# 1.3 文件结构
+#   2.x Imports + helpers
+#   3.x get_memory_dir / ENTRY_DELIMITER
+#   4.x _scan_memory_content / _drift_error
+#   5.x MemoryStore 类(490 行,核心)
+#   6.x memory_tool 入口函数(LLM 调的工具)
+#   7.x check_memory_requirements
+
 Provides bounded, file-backed memory that persists across sessions. Two stores:
   - MEMORY.md: agent's personal notes and observations (environment facts, project
     conventions, tool quirks, things learned)
@@ -23,6 +43,10 @@ Design:
 - Frozen snapshot pattern: system prompt is stable, tool responses show live state
 """
 
+# 2.1 Imports 分组
+# 标准库:json/logging/os/tempfile/time/pathlib
+# cross-platform:fcntl (Unix) / msvcrt (Windows) 二选一
+# 项目内:atomic_replace(原子写文件)、threat_patterns(安全扫描)
 import json
 import logging
 import os
@@ -36,6 +60,9 @@ from typing import Dict, Any, List, Optional
 from utils import atomic_replace
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
+# 2.2 跨平台文件锁
+# fcntl 只能在 Unix,msvcrt 只能在 Windows
+# 任一能 import 就行——Hermes 主要跑 Unix(Mac/Linux)
 msvcrt = None
 try:
     import fcntl
@@ -48,38 +75,47 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# Where memory files live — resolved dynamically so profile overrides
-# (HERMES_HOME env var changes) are always respected.  The old module-level
-# constant was cached at import time and could go stale if a profile switch
-# happened after the first import.
+# 3.1 get_memory_dir — 拿 memory 文件的目录
+# **动态获取**——profile 切换时 HERMES_HOME 会变,这里每次重算
+# (老版本是模块级常量,profile 切换后 stale)
 def get_memory_dir() -> Path:
     """Return the profile-scoped memories directory."""
     return get_hermes_home() / "memories"
 
+# 3.2 ENTRY_DELIMITER — 内存条目之间的分隔符
+# § 是 section sign,unicode 字符,很少出现在普通文本里
+# 多行条目里也用它,加上前后的 \n 让序列化/反序列化不依赖行数
 ENTRY_DELIMITER = "\n§\n"
 
 
 # ---------------------------------------------------------------------------
-# Memory content scanning — lightweight check for injection/exfiltration
-# in content that gets injected into the system prompt.
-#
-# Patterns live in ``tools/threat_patterns.py`` — the single source of truth
-# shared with the context-file scanner and the tool-result delimiter system.
-# Memory uses the "strict" scope (broadest pattern set) because:
-#  - memory entries are user-curated; the user can rewrite a flagged entry
-#  - memory enters the system prompt as a FROZEN snapshot, so a poisoned
-#    entry persists for the entire session and across sessions until
-#    explicitly removed.
+# 4.1 Memory content scanning — 轻量注入/泄露检测
+# ---------------------------------------------------------------------------
+# Patterns 在 tools/threat_patterns.py(单一来源,所有 scanner 共享)
+# Memory 用 "strict" scope(最严):
+#   * memory 是 user-curated,被 flag 后可以人工改
+#   * memory 进 system prompt 是 frozen 的,中毒条目持续整个 session
+#   * 跨 session 也还在(直到显式 remove)
 # ---------------------------------------------------------------------------
 
 from tools.threat_patterns import first_threat_message as _first_threat_message
 
 
+# 4.2 _scan_memory_content — 扫一段内容看有没有威胁
+# 返 None = 通过;返 str = 错误消息
 def _scan_memory_content(content: str) -> Optional[str]:
     """Scan memory content for injection/exfil patterns. Returns error string if blocked."""
     return _first_threat_message(content, scope="strict")
 
 
+# 4.3 _drift_error — "磁盘和 parser 状态不一致"时的错误响应
+# 场景:
+#   * patch tool 改了 MEMORY.md
+#   * shell >> MEMORY.md 追加了内容
+#   * 另一个 session 同时写入
+# 这种情况下,直接写会**覆盖**外部修改 → 静默数据丢失
+# 防御:拒绝写入,把磁盘当前内容备份到 .bak.<ts>,告诉用户怎么修
+# (issue #26045)
 def _drift_error(path: "Path", bak_path: str) -> Dict[str, Any]:
     """Build the error dict returned when external drift is detected.
 
@@ -110,6 +146,16 @@ def _drift_error(path: "Path", bak_path: str) -> Dict[str, Any]:
     }
 
 
+# 5.1 MemoryStore 类 — 490 行的核心
+# 每个 AIAgent 持一个实例
+#
+# === 双状态设计 ===
+#   * _system_prompt_snapshot: 冻结 snapshot(只在 load_from_disk 时设)
+#                            注入到 system prompt,整个 session 不变
+#                            → 保护 LLM prefix cache
+#   * memory_entries / user_entries: 活状态
+#                                  工具调用 mutate,持久化到磁盘
+#                                  工具响应总是反映这个"最新"状态
 class MemoryStore:
     """
     Bounded curated memory with file persistence. One instance per AIAgent.
@@ -121,6 +167,9 @@ class MemoryStore:
         Tool responses always reflect this live state.
     """
 
+    # 5.2 __init__ — 初始状态(还没 load_from_disk,snapshot 是空)
+    # memory_char_limit: 2200 字符(不是 token!char 数 model-independent)
+    # user_char_limit:   1375 字符
     def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375):
         self.memory_entries: List[str] = []
         self.user_entries: List[str] = []
@@ -129,6 +178,21 @@ class MemoryStore:
         # Frozen snapshot for system prompt -- set once at load_from_disk()
         self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
 
+    # 5.3 load_from_disk — session 启动时调一次
+    # 流程:
+    #   1. 读 MEMORY.md / USER.md
+    #   2. 去重
+    #   3. **sanitize**(每条都过威胁扫描)
+    #   4. 渲染成 markdown block
+    #   5. 存到 _system_prompt_snapshot
+    #
+    # **安全设计**:
+    #   中毒条目不进 snapshot(被 [BLOCKED: ...] 替换)
+    #   但**保留在** memory_entries / user_entries(用户能 read 看到)
+    #   → 防止"静默吃掉"用户可能正在 debug 的内容
+    #
+    # **prefix cache 保证**:
+    #   扫描是确定性的(从磁盘字节起算),所以 snapshot 在整个 session 内稳定
     def load_from_disk(self):
         """Load entries from MEMORY.md and USER.md, capture system prompt snapshot.
 
@@ -169,6 +233,9 @@ class MemoryStore:
             "user": self._render_block("user", sanitized_user),
         }
 
+    # 5.4 _sanitize_entries_for_snapshot — 静态方法
+    # 每条 entry 跑 threat scan;命中就用 [BLOCKED: ...] 替换
+    # 已经 blocked 标记的 / 空 entry 透传
     @staticmethod
     def _sanitize_entries_for_snapshot(entries: List[str], filename: str) -> List[str]:
         """Return ``entries`` with any threat-matching entry replaced by a placeholder.
@@ -184,13 +251,50 @@ class MemoryStore:
         """
         from tools.threat_patterns import scan_for_threats
 
+        # === 日志:函数入口 — 记下要扫多少条、来自哪个文件 ===
+        # 配 debug 级别:正常情况不打印,只排查时被 grep
+        # 用 logger.debug 而不是 .info:这是 hot path(每个 session 启动都跑),
+        # info 级别会污染日常日志
+        logger.debug(
+            "Memory sanitization starting: %d entries from %s",
+            len(entries), filename,
+        )
+
         sanitized: List[str] = []
-        for entry in entries:
+        blocked_count = 0   # 累计:被 blocked 的 entry 数
+        passed_count = 0    # 累计:clean 透传的 entry 数
+        for idx, entry in enumerate(entries):
+            # === 日志:进入扫描前 — 记下当前是第几条 + entry 长度 ===
+            # entry 长度比 entry 内容更重要:打印内容可能 PII / prompt injection 残留,
+            # 打印长度足以判断"是不是超长 entry"导致的性能问题
+            logger.debug(
+                "Memory sanitization scanning entry %d/%d from %s (len=%d)",
+                idx + 1, len(entries), filename, len(entry),
+            )
             if not entry or entry.startswith("[BLOCKED:"):
+                # === 日志:空 entry / 已 blocked 的 entry 透传 ===
+                # 这条分支不需要做扫描,但要记录"我们看到了,选择跳过"
+                # 否则排查"为什么这条 entry 进了 snapshot 却没看到扫描日志"会困惑
+                logger.debug(
+                    "Memory sanitization entry %d passed through "
+                    "(empty or already [BLOCKED: marker])",
+                    idx + 1,
+                )
                 sanitized.append(entry)
+                passed_count += 1
                 continue
             findings = scan_for_threats(entry, scope="strict")
             if findings:
+                # === 日志:threat 命中 — 已有 warning,补个 debug 看 entry 预览 ===
+                # warning 已经是"必须看到的告警",debug 这里补充:
+                #   * entry 前 100 字符(方便排查是哪种内容触发)
+                #   * findings 具体 ID(从 warning 也知道,但放一起方便 grep)
+                # %r 用 repr 形式打印,空格 / 换行会显式标出
+                logger.debug(
+                    "Memory sanitization THREAT found: entry %d from %s, "
+                    "findings=%s, entry_preview=%r",
+                    idx + 1, filename, findings, entry[:100],
+                )
                 logger.warning(
                     "Memory entry from %s blocked at load time: %s",
                     filename, ", ".join(findings),
@@ -201,10 +305,32 @@ class MemoryStore:
                     f"use memory(action=read) to inspect and memory(action=remove) "
                     f"to delete the original.]"
                 )
+                blocked_count += 1
             else:
+                # === 日志:clean entry — 显式记下"扫过了,没找到" ===
+                # 不打的话扫过 1000 条 clean entry 不会留下任何痕迹
+                # 排查"是不是某些 entry 被漏扫了"时这条日志能救命
+                logger.debug(
+                    "Memory sanitization entry %d clean (no threats)",
+                    idx + 1,
+                )
                 sanitized.append(entry)
+                passed_count += 1
+
+        # === 日志:函数出口汇总 — 1 行看清结果 ===
+        # 比 per-entry 日志更友好:大文件扫完时直接看汇总,
+        # 需要细节再 grep 单条
+        logger.debug(
+            "Memory sanitization done: %d passed, %d blocked, %d total from %s",
+            passed_count, blocked_count, len(entries), filename,
+        )
         return sanitized
 
+    # 5.5 _file_lock — context manager 形式的文件锁
+    # 关键:**用单独的 .lock 文件**锁,而不是锁 memory 文件本身
+    # 因为 atomic_replace 是 os.replace() 替换 inode,锁文件 inode 没用
+    # 两层 session 写同一个文件不会相互覆盖
+    # Unix: fcntl.flock; Windows: msvcrt.locking
     @staticmethod
     @contextmanager
     def _file_lock(path: Path):
@@ -242,6 +368,8 @@ class MemoryStore:
                     pass
             fd.close()
 
+    # 5.6 _path_for — target 名 → 磁盘文件
+    # "user" → USER.md;其它(默认 "memory") → MEMORY.md
     @staticmethod
     def _path_for(target: str) -> Path:
         mem_dir = get_memory_dir()
@@ -249,6 +377,12 @@ class MemoryStore:
             return mem_dir / "USER.md"
         return mem_dir / "MEMORY.md"
 
+    # 5.7 _reload_target — 在文件锁下"重新读最新"再 mutate
+    # 为什么要 reload?——两个 session 可能同时打开同一个文件
+    # 我们 mutate 之前要看到对方的最新修改,避免覆盖
+    # 返 backup 路径 = 检测到外部 drift(对方写的格式我们不认)
+    #   此时**不**flush,留给上层报错
+    # 返 None = 干净 reload,继续 mutate
     def _reload_target(self, target: str) -> Optional[str]:
         """Re-read entries from disk into in-memory state.
 
@@ -267,11 +401,14 @@ class MemoryStore:
         self._set_entries(target, fresh)
         return bak
 
+    # 5.8 save_to_disk — 每次 mutate 后持久化
+    # 走 atomic_replace 写(瞬间切换 inode,不会留半截文件)
     def save_to_disk(self, target: str):
         """Persist entries to the appropriate file. Called after every mutation."""
         get_memory_dir().mkdir(parents=True, exist_ok=True)
         self._write_file(self._path_for(target), self._entries_for(target))
 
+    # 5.9 _entries_for / _set_entries — target 字符串分派
     def _entries_for(self, target: str) -> List[str]:
         if target == "user":
             return self.user_entries
@@ -294,6 +431,16 @@ class MemoryStore:
             return self.user_char_limit
         return self.memory_char_limit
 
+    # 5.10 add — 追加一条 entry
+    # 流程:
+    #   1. trim content(去前后空白)
+    #   2. 空检查
+    #   3. **威胁扫描** (strict scope)
+    #   4. 文件锁 + reload
+    #   5. drift 检查
+    #   6. 去重检查(完全相同的不加)
+    #   7. 预算检查(加完会不会超字符上限)
+    #   8. 真 append + 写盘
     def add(self, target: str, content: str) -> Dict[str, Any]:
         """Append a new entry. Returns error if it would exceed the char limit."""
         content = content.strip()
@@ -344,6 +491,10 @@ class MemoryStore:
 
         return self._success_response(target, "Entry added.")
 
+    # 5.11 replace — 替换一条 entry
+    # 用**子串匹配**(不是 ID,不是整段)
+    # 原因:LLM 经常记不准完整文本
+    # 安全设计:多匹配时拒绝(除非全相同)
     def replace(self, target: str, old_text: str, new_content: str) -> Dict[str, Any]:
         """Find entry containing old_text substring, replace it with new_content."""
         old_text = old_text.strip()
@@ -404,6 +555,8 @@ class MemoryStore:
 
         return self._success_response(target, "Entry replaced.")
 
+    # 5.12 remove — 删一条 entry(子串匹配)
+    # 多匹配拒绝,除非全相同
     def remove(self, target: str, old_text: str) -> Dict[str, Any]:
         """Remove the entry containing old_text substring."""
         old_text = old_text.strip()
@@ -440,6 +593,10 @@ class MemoryStore:
 
         return self._success_response(target, "Entry removed.")
 
+    # 5.13 format_for_system_prompt — 拿 frozen snapshot
+    # 关键:**不**返 live state(活状态会 mid-session 变,污染 prefix cache)
+    # 返 load_from_disk 时的 snapshot
+    # 返 None = 加载时这个 target 没有 entry
     def format_for_system_prompt(self, target: str) -> Optional[str]:
         """
         Return the frozen snapshot for system prompt injection.
@@ -455,6 +612,8 @@ class MemoryStore:
 
     # -- Internal helpers --
 
+    # 5.14 _success_response — 标准成功响应(给 LLM 看)
+    # 包含:target / entries / usage 百分比 / entry_count / message
     def _success_response(self, target: str, message: str = None) -> Dict[str, Any]:
         entries = self._entries_for(target)
         current = self._char_count(target)
@@ -472,6 +631,9 @@ class MemoryStore:
             resp["message"] = message
         return resp
 
+    # 5.15 _render_block — 渲染 system prompt 块
+    # 格式:<HEADER>\n<entries joined>\n
+    # HEADER 含 "X% used" 提示(让 LLM 知道剩余空间)
     def _render_block(self, target: str, entries: List[str]) -> str:
         """Render a system prompt block with header and usage indicator."""
         if not entries:
@@ -567,6 +729,14 @@ class MemoryStore:
             return str(bak_path) + " (BACKUP FAILED — file unchanged on disk)"
         return str(bak_path)
 
+    # 5.16 _write_file — 写文件的"正确姿势"
+    # 关键:不用 open("w")+flock(那会先 truncate 再锁,有竞态)
+    # 改用:**temp file + atomic rename**
+    #   1. mkstemp 创临时文件
+    #   2. 写完 + fsync(确保落盘)
+    #   3. atomic_replace = os.replace(瞬间切 inode)
+    # 读者永远看到完整的旧文件或完整的新文件
+    # 同一个 directory 才保证 atomic rename(不同 fs 上 os.replace 可能 fail)
     @staticmethod
     def _write_file(path: Path, entries: List[str]):
         """Write entries to a memory file using atomic temp-file + rename.
@@ -599,6 +769,10 @@ class MemoryStore:
             raise RuntimeError(f"Failed to write memory file {path}: {e}")
 
 
+# 6.1 memory_tool — LLM 调的工具入口
+# 单一函数分发 4 个 action:add / replace / remove
+# (read 不在这——read 通过 prompt 里的 snapshot + memory tool 的 response 看)
+# 参数校验:store 必须有 / target 必须是 memory/user / action 必须有对应必填参数
 def memory_tool(
     action: str,
     target: str = "memory",
@@ -640,6 +814,9 @@ def memory_tool(
     return json.dumps(result, ensure_ascii=False)
 
 
+# 6.2 check_memory_requirements — 兼容性钩子
+# 别的工具(比如 web_search)有 check_fn 查"环境是否支持"
+# memory 总可用,永远返 True
 def check_memory_requirements() -> bool:
     """Memory tool has no external requirements -- always available."""
     return True
@@ -647,6 +824,19 @@ def check_memory_requirements() -> bool:
 
 # =============================================================================
 # OpenAI Function-Calling Schema
+# =============================================================================
+# 7.1 MEMORY_SCHEMA — OpenAI function-calling 格式的工具 schema
+# 7.1 关键:description 写得**非常长**——这是 LLM 决定"要不要调"的唯一依据
+# 7.1 包含:
+#   * WHEN TO SAVE(主动调用的场景)
+#   * PRIORITY(用户偏好 > 环境事实 > 流程)
+#   * DO NOT save(任务进度、session 结果)
+#   * TWO TARGETS 区分
+#   * 3 ACTIONS
+#   * SKIP 列表
+# 7.1 注意:这种"长 description"是 Hermes 工具的普遍风格——
+# 7.1 LLM 看到 description 才会知道"什么时候该调 / 不该调"
+# 7.1 不像普通 API doc,这是给 LLM 看的"行为指南"
 # =============================================================================
 
 MEMORY_SCHEMA = {

@@ -437,13 +437,46 @@ class SessionDB:
             _set_last_init_error(f"{type(exc).__name__}: {exc}")
             raise
 
+    # ─────────────────────────────────────────────────────────────────────
+    # 1.6 __init__ — 打开 SQLite 连接、设 WAL、建 schema
+    # ─────────────────────────────────────────────────────────────────────
+    #
+    # === 这是干什么的? ===
+    # SessionDB 的入口:打开 ~/.hermes/state.db,设置 WAL 模式,
+    # 初始化 schema(创建表 + 调 reconcile)。
+    #
+    # === 关键设计点 ===
+    #   1. check_same_thread=False — 允许多线程共用 1 个连接
+    #      (Hermes gateway / web_server 都有 per-request SessionDB)
+    #   2. timeout=1.0 — 短超时,应用层做 jitter retry
+    #      (不靠 SQLite 内部 busy handler 等 30 秒)
+    #   3. isolation_level=None — 自己管 transaction
+    #      (默认的 "deferred" 跟我们的 BEGIN IMMEDIATE 冲突)
+    #   4. _init_schema() — 启动时建表 + 调 _reconcile_columns 加缺失列
+    #      失败时 _set_last_init_error 记录原因,供 /resume 等 slash 命令用
+    #
+    # === 为什么失败要保留 _last_init_error? ===
+    # 多线程场景下,线程 A 失败 → 线程 B 成功打开,如果在 except 里清掉 error
+    # 线程 A 的 /resume 就会显示 "Session database not available" 而不知道原因
+    # 故**故意**不写 else 分支,只在测试时显式 reset
+    # ─────────────────────────────────────────────────────────────────────
+
     # ── Core write helper ──
 
+    # 1.13 _is_fts5_unavailable_error — 判断 sqlite 报错是不是"FTS5 不可用"
+    # 用途:有些 pip 安装的 python 携带的 sqlite 不带 FTS5 模块
+    #      此时所有 FTS5 操作会抛 "no such module: fts5"
+    # 判定:错误信息里**同时**含 "no such module" 和 "fts5" 两个关键词
+    # 用 lower() 防止大小写不一致
     @staticmethod
     def _is_fts5_unavailable_error(exc: sqlite3.OperationalError) -> bool:
         err = str(exc).lower()
         return "no such module" in err and "fts5" in err
 
+    # 1.14 _warn_fts5_unavailable — FTS5 不可用时只警告 1 次
+    # 关键:_fts_unavailable_warned flag 保证**只警告 1 次**(避免刷屏)
+    # 一旦标记为不可用,后续调用 no-op
+    # 警告文案里给用户装环境的链接 — https://hermes-agent.nousresearch.com
     def _warn_fts5_unavailable(self, exc: sqlite3.OperationalError) -> None:
         self._fts_enabled = False
         if self._fts_unavailable_warned:
@@ -461,6 +494,11 @@ class SessionDB:
             exc,
         )
 
+    # 1.15 _sqlite_supports_fts5 — 探针,验证当前 sqlite 是否带 FTS5
+    # 做法:CREATE VIRTUAL TABLE temp._hermes_fts5_probe USING fts5(x)
+    #      成功 = 带;失败 = 不带
+    # 用 temp table 不污染 schema
+    # DROP 掉探针表(虽然 temp 也会自动清)
     def _sqlite_supports_fts5(self, cursor: sqlite3.Cursor) -> bool:
         try:
             cursor.execute("CREATE VIRTUAL TABLE temp._hermes_fts5_probe USING fts5(x)")
@@ -472,6 +510,11 @@ class SessionDB:
             self._warn_fts5_unavailable(exc)
             return False
 
+    # 1.16 _drop_fts_triggers — 删 FTS5 同步触发器
+    # 触发器在 messages 表 INSERT/UPDATE/DELETE 时同步更新 messages_fts
+    # 删触发器 → 后续写不再同步 FTS,但 messages_fts 表还在
+    # 用途:_init_schema 里,如果探测到 FTS5 不可用,先删触发器
+    #      这样写消息不再因 FTS 错误失败(降级)
     @staticmethod
     def _drop_fts_triggers(cursor: sqlite3.Cursor) -> None:
         for trigger in _FTS_TRIGGERS:
@@ -480,6 +523,11 @@ class SessionDB:
             except sqlite3.OperationalError:
                 pass
 
+    # 1.17 _fts_trigger_count — 数 FTS 触发器还剩几个
+    # 配合 _drop_fts_triggers / _ensure_fts_schema:
+    # 删完触发器后,这个数应该 = 0
+    # 重建后会回到 _FTS_TRIGGERS 列表长度
+    # 用 ? 占位符 + 列表拼 IN(?,?,?) — 避免 SQL 注入
     @staticmethod
     def _fts_trigger_count(cursor: sqlite3.Cursor) -> int:
         placeholders = ",".join("?" for _ in _FTS_TRIGGERS)
@@ -490,6 +538,13 @@ class SessionDB:
         ).fetchone()
         return int(row[0] if not isinstance(row, sqlite3.Row) else row[0])
 
+    # 1.18 _rebuild_fts_indexes — 从 messages 表重建 FTS 索引
+    # 适用场景:
+    #   1. 首次启用 FTS(触发器被删过,现在要重建)
+    #   2. messages 表被批量导入(SQL 文件恢复)
+    # 做法:DELETE FROM messages_fts + 重新 INSERT
+    # 注意:content / tool_name / tool_calls 三个字段都进 FTS
+    #  → 全文搜索能搜到工具名 + 工具结果
     @staticmethod
     def _rebuild_fts_indexes(cursor: sqlite3.Cursor) -> None:
         for table_name in ("messages_fts", "messages_fts_trigram"):
@@ -511,6 +566,12 @@ class SessionDB:
             "FROM messages"
         )
 
+    # 1.19 _fts_table_probe — 探测 FTS5 virtual table 是否可用
+    # 3 种状态用 Optional[bool] 表达:
+    #   True  = 存在且能查
+    #   False = 真的不存在(走 _ensure_fts_schema 创建)
+    #   None  = FTS5 模块不可用(整个降级,不再尝试)
+    # 通过 SELECT * FROM table LIMIT 0 探针 — 不返回数据,只验 schema
     def _fts_table_probe(self, cursor: sqlite3.Cursor, table_name: str) -> Optional[bool]:
         try:
             cursor.execute(f"SELECT * FROM {table_name} LIMIT 0")
@@ -523,6 +584,11 @@ class SessionDB:
                 return False
             raise
 
+    # 1.20 _ensure_fts_schema — 确保 FTS5 virtual table + 触发器存在
+    # 关键设计:即使表已存在,也要 executescript 跑 DDL
+    # 原因:之前 no-FTS5 runtime 把触发器删了,现在 FTS5 恢复了
+    #      触发器要重建 — executescript 里的 CREATE TRIGGER IF NOT EXISTS 会无脑跑
+    # 返 True = 成功(可用);False = FTS5 不可用(降级)
     def _ensure_fts_schema(
         self,
         cursor: sqlite3.Cursor,
@@ -544,6 +610,26 @@ class SessionDB:
             self._warn_fts5_unavailable(exc)
             return False
 
+    # 1.10 _execute_write — 所有写操作的事务包装(本类最重要的方法之一)
+    #
+    # === 这是干什么的? ===
+    # 包装 BEGIN IMMEDIATE + 业务函数 + COMMIT,加 jitter retry 防锁竞争。
+    # 所有 INSERT / UPDATE / DELETE 都应该走这个,**不要**直接调 self._conn。
+    #
+    # === 关键设计 ===
+    #   1. BEGIN IMMEDIATE — 事务**开始**就抢 WAL 写锁(不是 commit 时)
+    #      → 锁竞争立刻浮面,不会到 commit 才发现
+    #   2. jitter retry — 失败后等 20-150ms **随机**时间,重试
+    #      → 打破 convoy pattern(大家都等同样的退避时间,继续挤)
+    #   3. caller **不能**调 commit — 这层统一管
+    #   4. 每 50 次写做 1 次 PASSIVE WAL checkpoint
+    #      → 防止 WAL 文件无限增长
+    #
+    # === 错误处理 ===
+    #   * 业务函数抛异常 → rollback → 重新 raise
+    #   * "locked"/"busy" → sleep + retry
+    #   * 其他 SQLite 错 → 直接抛(不重试)
+    #   * 重试用尽 → 抛 last_err
     def _execute_write(self, fn: Callable[[sqlite3.Connection], T]) -> T:
         """Execute a write transaction with BEGIN IMMEDIATE and jitter retry.
 
@@ -596,6 +682,10 @@ class SessionDB:
             "database is locked after max retries"
         )
 
+    # 1.11 _try_wal_checkpoint — PASSIVE WAL checkpoint(每 50 次写触发 1 次)
+    # PASSIVE 模式:**不阻塞**别的事务,不抢锁,只把"没人在用"的 WAL frame 落盘
+    # 配合 _execute_write 的 N-write 计数,定期触发,防止 WAL 文件无限增长
+    # 失败永远吞掉(best-effort)— checkpoint 不是关键路径
     def _try_wal_checkpoint(self) -> None:
         """Best-effort PASSIVE WAL checkpoint.  Never blocks, never raises.
 
@@ -617,6 +707,11 @@ class SessionDB:
         except Exception:
             pass  # Best effort — never fatal.
 
+    # 1.7 close — 关闭连接(出口前最后做 1 次 PASSIVE checkpoint)
+    # 设计:进程退出前帮忙做一次 checkpoint,WAL 文件不会无限增长
+    # 跟 _try_wal_checkpoint 区别:close 是**用户主动调**的(进程退出)
+    # _try_wal_checkpoint 是 _execute_write 自动周期性触发
+    # 错误吞掉(best-effort)— close 阶段不能因为 checkpoint 失败导致关连接失败
     def close(self):
         """Close the database connection.
 
@@ -632,6 +727,13 @@ class SessionDB:
                 self._conn.close()
                 self._conn = None
 
+    # 1.8 _parse_schema_columns — 从 SCHEMA_SQL 解析"期望的列"
+    # 巧妙之处:**用 in-memory SQLite 自己解析 DDL**,不写 regex
+    # 原因:DEFAULT 表达式里可能有逗号、CHECK 约束里可能有括号、REFERENCES 嵌套
+    #      用 regex 解析这些**一定会出 edge case bug**
+    #      让 SQLite 自己 parse,提取 PRAGMA table_info — 0 边界问题
+    # 配合 _reconcile_columns → 整 schema 演化是**声明式**的
+    # 加新列?改 SCHEMA_SQL 一行就行
     @staticmethod
     def _parse_schema_columns(schema_sql: str) -> Dict[str, Dict[str, str]]:
         """Extract expected columns per table from SCHEMA_SQL.
@@ -675,6 +777,11 @@ class SessionDB:
         finally:
             ref.close()
 
+    # 1.9 _reconcile_columns — 声明式 schema 演化(Beets 模式)
+    # 流程:从 SCHEMA_SQL 拿"期望列"→ PRAGMA table_info 拿"实际列" → 差集 ALTER ADD
+    # **完全不需要**写版本号判断的 migration 块
+    # 加 1 个列 → 改 SCHEMA_SQL 1 行 → 下次启动自动加上去
+    # 错误吞掉(DEBUG 级别):"duplicate column name"是预期的(并发),不报警
     def _reconcile_columns(self, cursor: sqlite3.Cursor) -> None:
         """Ensure live tables have every column declared in SCHEMA_SQL.
 
@@ -719,6 +826,25 @@ class SessionDB:
                             "reconcile %s.%s: %s", table_name, col_name, exc,
                         )
 
+    # 1.12 _init_schema — bootstrap 整个 schema(创建 + 调和 + 索引)
+    #
+    # === 这是干什么的? ===
+    # SessionDB 启动时调的"建表总入口":跑 SCHEMA_SQL → reconcile 加列 → 补索引
+    #
+    # === 4 个步骤 ===
+    #   1. cursor.executescript(SCHEMA_SQL)  一次性跑所有 CREATE TABLE
+    #   2. self._reconcile_columns(cursor)  声明式加缺失列(见 1.9)
+    #   3. CREATE INDEX IF NOT EXISTS ...    部分索引(reconcile 之后才能建)
+    #   4. cursor.executescript(DEFERRED_INDEX_SQL)  延后索引
+    #
+    # === 顺序的重要性 ===
+    # 索引里 WHERE 引用了 reconcile 加的列(如 ``active``)
+    # 如果在 reconcile **之前** 跑 CREATE INDEX,初始启动会失败
+    # → 必须在 reconcile **之后** 才能建
+    #
+    # === schema_version 表保留 ===
+    # 数据迁移(改老行的内容)不能声明式做,需要版本号管理
+    # 所以 schema_version 表还在,留给未来的 data migration
     def _init_schema(self):
         """Create tables and FTS if they don't exist, reconcile columns.
 
@@ -909,6 +1035,12 @@ class SessionDB:
     # Session lifecycle
     # =========================================================================
 
+    # 1.31 _insert_session_row — 共享的 INSERT OR IGNORE 入口
+    # 跟 create_session / ensure_session 配合:
+    #   * 这俩是"对外"的薄包装
+    #   * 这个是"对内"的实际写库函数
+    # INSERT OR IGNORE → 已存在 session_id 时静默 no-op(并发安全)
+    # 字段全集:source / user_id / model / model_config / system_prompt / parent / cwd
     def _insert_session_row(
         self,
         session_id: str,
@@ -940,10 +1072,24 @@ class SessionDB:
             )
         self._execute_write(_do)
 
+    # 1.1 create_session — 创建一条 session 记录
+    # 4 个公开方法之一,对应"开始一个新对话"
+    # 实际写库在 _insert_session_row(管 schema 细节)
+    # 这里就是个 thin wrapper
+    #   session_id: 自己 generate 的 UUID(调用方决定)
+    #   source:     "cli" / "telegram" / "discord" / "gateway" ...
+    #   **kwargs:   model / title / cwd 等其他字段
+    # 返 session_id(方便调用方链式调用)
     def create_session(self, session_id: str, source: str, **kwargs) -> str:
         """Create a new session record. Returns the session_id."""
         self._insert_session_row(session_id, source, **kwargs)
         return session_id
+    # 1.21 end_session — 标记 session 结束
+    # 关键设计:**first end_reason wins**
+    # 如果 session 已经被 end 过(有 ended_at),UPDATE 不生效
+    # 这保护 compression 拆分的 session — 即使 stale 的 /resume 错误地又 end 一次
+    # 也不会覆盖掉原本的 "compression" 原因
+    # 想覆盖?先调 reopen_session() 再 end
     def end_session(self, session_id: str, end_reason: str) -> None:
         """Mark a session as ended.
 
@@ -962,6 +1108,10 @@ class SessionDB:
             )
         self._execute_write(_do)
 
+    # 1.22 reopen_session — 撤销 end_session(让 session 可被 /resume)
+    # 简单:UPDATE sessions SET ended_at = NULL, end_reason = NULL
+    # 不检查 ended_at 当前是什么 — 反正就是要清掉
+    # 用例:/resume 之前如果目标 session 被 end 过,先 reopen
     def reopen_session(self, session_id: str) -> None:
         """Clear ended_at/end_reason so a session can be resumed."""
         def _do(conn):
@@ -971,6 +1121,10 @@ class SessionDB:
             )
         self._execute_write(_do)
 
+    # 1.23 update_session_cwd — 持久化 session 的工作目录
+    # 用途:CLI 报告 cwd 后存进 session
+    # 让 /resume 时能恢复到原 cwd(不用每次重新 cd)
+    # 早返回:session_id 或 cwd 为空 → no-op(防写入空数据)
     def update_session_cwd(self, session_id: str, cwd: str) -> None:
         """Persist the session working directory when a frontend knows it."""
         if not session_id or not cwd:
@@ -1001,6 +1155,25 @@ class SessionDB:
     # the compress() call plus the rotation. ``holder`` identifies the
     # current owner (pid:tid:nonce) for diagnostics; the lock is recovered
     # via ``expires_at`` if the holder process crashed without releasing.
+    # 1.2 try_acquire_compression_lock — 压缩互斥锁(原子的)
+    # 用途:防止两个 compression path 同时压缩同一个 session
+    # race:conversation_compression.py 压缩成功后会**旋转 session_id**
+    #       如果两个 compressor 同时跑,都会旋转,导致 lineage 错乱
+    #
+    # === 实现 ===
+    # 单事务里三步:
+    #   1. DELETE 过期锁(stale 锁可以被新 holder 接管,防 compressor 崩溃死锁)
+    #   2. INSERT OR IGNORE 新锁(主键冲突时 IGNORE)
+    #   3. SELECT 验证自己是不是 holder
+    # SQLite 串行化写,这三步原子
+    #
+    # === TTL 默认 300s ===
+    # 万一 compressor 崩了不释放,5 分钟后自动过期
+    # 防御:压缩半截不会永久卡住 session
+    #
+    # === Fail open 哲学 ===
+    # 如果 lock 子系统本身坏了 → 返 False → caller 跳过压缩
+    # 这是"安全失败"——不压缩还能用,锁崩了不能冒险
     def try_acquire_compression_lock(
         self,
         session_id: str,
@@ -1063,6 +1236,11 @@ class SessionDB:
             # which is the safe behaviour when the lock subsystem is broken.
             return False
 
+    # 1.5 release_compression_lock — 释放压缩锁(必须是自己 holder)
+    # 4 个公开方法之四(compress_session 在 Hermes 里实际是这套锁)
+    # 关键:**必须有 holder 参数**
+    # 只删 holder 匹配的——不会误删别人的锁
+    # 错误兜底:release 失败只 warning,不当致命错误
     def release_compression_lock(self, session_id: str, holder: str) -> None:
         """Release the compression lock for ``session_id`` iff we own it.
 
@@ -1089,6 +1267,10 @@ class SessionDB:
                 session_id, exc,
             )
 
+    # 1.24 get_compression_lock_holder — 查锁 holder(诊断用)
+    # 不是锁协议的一部分(协议用 try_acquire / release)
+    # 用途:调试时查"现在谁拿着这个 session 的压缩锁"
+    # 返 None = 没锁 / 锁已过期
     def get_compression_lock_holder(self, session_id: str) -> Optional[str]:
         """Return the current (non-expired) holder for ``session_id``, or None.
 
@@ -1107,6 +1289,11 @@ class SessionDB:
         return row["holder"] if isinstance(row, sqlite3.Row) else row[0]
 
 
+    # 1.25 update_system_prompt — 存整段 system prompt 快照
+    # 用途:session 启动时调一次,把拼好的完整 system prompt 存进 sessions 表
+    # 之后 /history 等 UI 可以看当时是什么 prompt
+    # 跟 volatile tier 的 system prompt 是不同的存
+    #  (运行时 system prompt 在内存里,这个在数据库里给历史回放用)
     def update_system_prompt(self, session_id: str, system_prompt: str) -> None:
         """Store the full assembled system prompt snapshot."""
         def _do(conn):
@@ -1116,6 +1303,10 @@ class SessionDB:
             )
         self._execute_write(_do)
 
+    # 1.26 update_session_model — 强制设 session 的 model 列
+    # 跟 update_token_counts 区别:这里是**无条件**UPDATE
+    # 用户跑 /model 切了模型后,dashboard 要反映最新选择
+    # 而 token 计数用 COALESCE(model, ?) 只在 NULL 时填
     def update_session_model(self, session_id: str, model: str) -> None:
         """Update the model for a session after a mid-session switch.
 
@@ -1130,6 +1321,21 @@ class SessionDB:
             )
         self._execute_write(_do)
 
+    # 1.27 update_token_counts — 更新 token / 费用 / api_call 计数
+    #
+    # === 关键设计:absolute 模式 ===
+    #   absolute=False (默认) → **累加**(用 input_tokens + ?)
+    #       适用:CLI 路径,每 API call 传 delta
+    #   absolute=True        → **直接设**(用 input_tokens = ?)
+    #       适用:gateway 路径,cached agent 已经持有累计值
+    #
+    # === COALESCE(model, ?) 模式 ===
+    # 只在 model 为 NULL 时填入(避免覆盖用户在 /model 后改的)
+    # 配合 update_session_model — 一个"只填",一个"必盖"
+    #
+    # === 防 race ===
+    # 先 _insert_session_row(... "unknown") → 防止 cron / kanban / delegate 并发下
+    # 初始 create_session 失败 → UPDATE 静默 0 行
     def update_token_counts(
         self,
         session_id: str,
@@ -1229,6 +1435,12 @@ class SessionDB:
             conn.execute(sql, params)
         self._execute_write(_do)
 
+    # 1.28 ensure_session — 幂等的"建或得"session
+    # 比 create_session 更"松":
+    #   * source 默认 "unknown"(不用 caller 决定)
+    #   * 其他字段从 **kwargs 透传
+    # 实现就是 INSERT OR IGNORE — 已存在则 no-op
+    # 用途:晚到的 token counter / metadata 写入,先确保 session 行存在
     def ensure_session(
         self,
         session_id: str,
@@ -1240,6 +1452,15 @@ class SessionDB:
         self._insert_session_row(session_id, source, model=model, **kwargs)
         return session_id
 
+    # 1.29 prune_empty_ghost_sessions — 删 TUI "ghost" session
+    # Ghost 定义:
+    #   * source = 'tui'
+    #   * title IS NULL
+    #   * ended_at IS NOT NULL
+    #   * started_at > 24 小时前
+    #   * 没有 messages(空 session)
+    # 这种是用户开了 TUI 又立刻关的"幻影", 24h 后清掉
+    # 删完还会调 _remove_session_files 清磁盘 .json / .jsonl
     def prune_empty_ghost_sessions(self, sessions_dir: "Optional[Path]" = None) -> int:
         """Remove empty TUI ghost sessions (no messages, no title, >24hr old)."""
         cutoff = time.time() - 86400  # Only sessions older than 24 hours
@@ -1270,6 +1491,11 @@ class SessionDB:
                 self._remove_session_files(sessions_dir, sid)
         return len(removed_ids)
 
+    # 1.30 finalize_orphaned_compression_sessions — 修复 #20001
+    # 修的 bug:压缩旋转后,某些 child session 永远不被 end_session
+    # 现象:子 session 有 messages、没 end_reason、api_call_count=0
+    # 解法:7 天后扫描,把这种 child 标 ended_at + end_reason='orphaned_compression'
+    # **非破坏性**:所有 messages 保留
     def finalize_orphaned_compression_sessions(self) -> int:
         """Mark orphaned compression continuation sessions as ended.
 
@@ -1309,6 +1535,8 @@ class SessionDB:
 
         return self._execute_write(_do) or 0
 
+    # 1.63 get_session — 拿 1 个 session 完整 row
+    # 简单 SELECT * WHERE id=?,返 dict 或 None
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Get a session by ID."""
         with self._lock:
@@ -1318,6 +1546,11 @@ class SessionDB:
             row = cursor.fetchone()
         return dict(row) if row else None
 
+    # 1.64 resolve_session_id — ID 或前缀 → 完整 ID
+    # 用途:用户输 "abc123" 想 resume,系统能补全成 "abc123-def456-..."
+    # 先 exact match,再用 LIKE prefix match
+    # **多个**匹配 → 返 None(歧义,不能猜)
+    # ESCAPE '\' 防 LIKE 通配符误匹配
     def resolve_session_id(self, session_id_or_prefix: str) -> Optional[str]:
         """Resolve an exact or uniquely prefixed session ID to the full ID.
 
@@ -1348,6 +1581,14 @@ class SessionDB:
     # Maximum length for session titles
     MAX_TITLE_LENGTH = 100
 
+    # 1.33 sanitize_title — 校验 + 清洗 title
+    # 干 5 件事:
+    #   1. 去首尾空白
+    #   2. 去 ASCII 控制字符(0x00-0x1F, 0x7F)但保留 \t \n \r
+    #   3. 去 Unicode 控制字符(零宽 / RTL override / 双向等)
+    #   4. 合并连续空白为 1 个空格
+    #   5. 限制 MAX_TITLE_LENGTH=100
+    # 返清洗后字符串 / None / ValueError(过长)
     @staticmethod
     def sanitize_title(title: Optional[str]) -> Optional[str]:
         """Validate and sanitize a session title.
@@ -1392,6 +1633,11 @@ class SessionDB:
 
         return cleaned
 
+    # 1.38 set_session_title — 设/改 session title
+    # 约束:
+    #   * title 唯一(整个 sessions 表)→ 重复抛 ValueError
+    #   * title 走 sanitize_title(去控制字符 + 限长)
+    # 返:True = 找到且设了;False = session 不存在
     def set_session_title(self, session_id: str, title: str) -> bool:
         """Set or update a session's title.
 
@@ -1421,6 +1667,9 @@ class SessionDB:
         rowcount = self._execute_write(_do)
         return rowcount > 0
 
+    # 1.34 get_session_title — 拿 title
+    # 简单 SELECT,返 title 列或 None
+    # 用 self._lock 短锁(读不需要事务)
     def get_session_title(self, session_id: str) -> Optional[str]:
         """Get the title for a session, or None."""
         with self._lock:
@@ -1430,6 +1679,9 @@ class SessionDB:
             row = cursor.fetchone()
         return row["title"] if row else None
 
+    # 1.35 get_session_by_title — 按 title 查 session
+    # 返完整 session dict(不只是 id)
+    # 用 SELECT * — call site 拿到所有列
     def get_session_by_title(self, title: str) -> Optional[Dict[str, Any]]:
         """Look up a session by exact title. Returns session dict or None."""
         with self._lock:
@@ -1468,6 +1720,11 @@ class SessionDB:
             return exact["id"]
         return None
 
+    # 1.36 get_next_title_in_lineage — 计算 lineage 下一个编号 title
+    # 例:base="my session", 已有 "my session" 和 "my session #2"
+    #     → 返 "my session #3"
+    # 步骤:剥现有 #N 后缀 → 找最大编号 → +1
+    # ESCAPE '\' 防 LIKE 通配符(% / _)误匹配
     def get_next_title_in_lineage(self, base_title: str) -> str:
         """Generate the next title in a lineage (e.g., "my session" → "my session #2").
 
@@ -1503,6 +1760,10 @@ class SessionDB:
 
         return f"{base} #{max_num + 1}"
 
+    # 1.37 get_compression_tip — 沿压缩链走到 tip
+    # 用途:压缩会把 1 个 session 拆成 parent + child + grandchild + ...
+    # 查"最新那个"(tip) — UI 列表显示时只显示 tip,隐藏中间
+    # 走 parent_session_id 指针,直到 NULL/没 parent 为止
     def get_compression_tip(self, session_id: str) -> Optional[str]:
         """Walk the compression-continuation chain forward and return the tip.
 
@@ -1539,6 +1800,10 @@ class SessionDB:
             current = row["id"]
         return current
 
+    # 1.41 list_sessions_rich — 列 session 列表(富信息版)
+    # 比 SELECT * 多:preview(首条 user message 摘要) + last_active + compression_tip
+    # 用途:/history 命令、UI 列表展示
+    # 支持 source 过滤 + exclude_sources 反向过滤 + limit
     def list_sessions_rich(
         self,
         source: str = None,
@@ -1733,6 +1998,9 @@ class SessionDB:
 
         return sessions
 
+    # 1.42 _get_session_rich_row — 单 session 富信息(内部 helper)
+    # 跟 list_sessions_rich 区别:这个只查 1 个
+    # 给 list_sessions_rich 复用 + 单独的"看一个 session 详情"调用
     def _get_session_rich_row(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Fetch a single session with the same enriched columns as
         ``list_sessions_rich`` (preview + last_active). Returns None if the
@@ -1779,6 +2047,12 @@ class SessionDB:
     _CONTENT_JSON_PREFIX = "\x00json:"
 
     @classmethod
+    # 1.43 _encode_content — 多模态 content 编码(sentinel + JSON)
+    # 为什么需要?SQLite content 列 TEXT,但 multimodal message 是 list[dict]
+    # 解决:list/dict → JSON 串 → 前面加 \x00json: sentinel
+    # sentinel 用 NUL 字节开头 → 不会跟正常文本冲突(NUL 在 text 里非法)
+    # 安全标量(str/int/float)原样返回
+    # 配套:_decode_content 反向解析
     def _encode_content(cls, content: Any) -> Any:
         """Serialize structured (list/dict) message content for sqlite.
 
@@ -1801,6 +2075,9 @@ class SessionDB:
             return str(content)
 
     @classmethod
+    # 1.44 _decode_content — 反向解析 _encode_content 的 sentinel+JSON
+    # 标量原样返回 / sentinel 开头 → JSON.loads / 否则原样
+    # 容错:JSON 解析失败 → 返原值(不抛)— 数据损坏时降级
     def _decode_content(cls, content: Any) -> Any:
         """Reverse :meth:`_encode_content`; returns scalars unchanged."""
         if isinstance(content, str) and content.startswith(cls._CONTENT_JSON_PREFIX):
@@ -1814,6 +2091,23 @@ class SessionDB:
                 return content
         return content
 
+    # 1.3 append_message — 追加一条 message 到 session(4 个公开方法之二)
+    # 返 message row ID(给 LLM 看到 tool_call_id 之外的稳定引用)
+    #
+    # === 入参多 ===
+    # 不仅 role + content,还有:
+    #   * tool_name / tool_calls / tool_call_id (tool 消息用)
+    #   * reasoning / reasoning_content / reasoning_details (Claude/o1 推理)
+    #   * codex_*_items (Codex Responses 协议专属)
+    #   * platform_message_id (Telegram 等外部平台的 msg_id,用来做 redact)
+    #   * observed (是否从外部平台看到,影响可见性)
+    #
+    # === 重要细节 ===
+    # * JSON 序列化所有结构化字段(reasoning_details / codex items / tool_calls)
+    #   SQLite 不能直接 bind list/dict
+    # * content 走 _encode_content(支持 multimodal:list of parts → JSON)
+    # * 顺手更新 session.message_count(如果 role=tool 还 +tool_call_count)
+    # * 全部在一个 _execute_write 事务里(原子)
     def append_message(
         self,
         session_id: str,
@@ -1911,6 +2205,11 @@ class SessionDB:
 
         return self._execute_write(_do)
 
+    # 1.32 replace_messages — 原子"删 + 重插"整个 transcript
+    # 用途:/retry /undo /compress 等需要重写整段对话的场景
+    # 必须 1 个事务:删 + 插**不能**分两次
+    #  → 中途失败 = 留下空 session(灾难)
+    # 原子性由 _execute_write 保障(BEGIN IMMEDIATE + 1 次 commit)
     def replace_messages(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
         """Atomically replace every message for a session.
 
@@ -1997,6 +2296,23 @@ class SessionDB:
 
         self._execute_write(_do)
 
+    # 1.4 get_messages — 加载 session 全部 messages(4 个公开方法之三)
+    # 4 个公开方法里**最常调**——主循环 / context compressor / session_search 都靠它
+    #
+    # === 顺序保证 ===
+    # 用 AUTOINCREMENT id 排序,不是 timestamp
+    # 原因:WSL2 上 clock 偶尔回退(commit c03acca50)
+    # 用 id 永远单调递增,顺序永远对
+    #
+    # === include_inactive 参数 ===
+    # 默认 False = 只返 active=1 的
+    # True = 含软删的(给 audit / debug / /undo 用)
+    # 软删是 rewind_to_message 用的——不是真删,而是 active=0
+    #
+    # === 解码 ===
+    # content 走 _decode_content(可能从 JSON 还原 multimodal)
+    # tool_calls 从 JSON 字符串还原成 list
+    # 失败兜底:tool_calls → []
     def get_messages(
         self, session_id: str, include_inactive: bool = False
     ) -> List[Dict[str, Any]]:
@@ -2032,6 +2348,11 @@ class SessionDB:
             result.append(msg)
         return result
 
+    # 1.45 get_messages_around — 锚点窗口读 messages
+    # 用途:UI 显示"某条 message 周围的内容"(前后各 N 条)
+    # 例:/history 显示某条 user message 周围 5 条
+    # 锚点:message_id,前后各取 before / after 条
+    # 内部用 ROWID 比较,O(log n) 索引扫描
     def get_messages_around(
         self,
         session_id: str,
@@ -2110,6 +2431,10 @@ class SessionDB:
             "messages_after": messages_after,
         }
 
+    # 1.46 get_anchored_view — 锚点 + 头尾(3 段)
+    # 在 get_messages_around 之上:不光给中间,还拼上头尾的 bookend
+    # 用途:长 session 搜索时 — "开头 N 条 + 命中周围 + 结尾 N 条"
+    # 3 slice 不重叠,UI 可以清晰分块展示
     def get_anchored_view(
         self,
         session_id: str,
@@ -2230,6 +2555,11 @@ class SessionDB:
             "bookend_end": [_hydrate(r) for r in bookend_end_rows],
         }
 
+    # 1.55 resolve_resume_session_id — /resume 时把 session_id 重定向
+    # 场景:用户给老 session_id 跑 /resume
+    # 老 session 可能是压缩链中间节点,没 messages 了
+    # 沿着 parent_session_id 走到 tip(真正有 messages 那个)
+    # 返:能 resume 的 session_id
     def resolve_resume_session_id(self, session_id: str) -> str:
         """Redirect a resume target to the descendant session that holds the messages.
 
@@ -2295,6 +2625,10 @@ class SessionDB:
                 current = child_id
         return session_id
 
+    # 1.47 get_messages_as_conversation — 转 OpenAI 对话格式
+    # messages 表里存的是带 metadata 的 row,要喂 LLM 必须转成 OpenAI 格式
+    # {role: "user"/"assistant"/"tool", content: ..., tool_call_id / tool_calls: ...}
+    # 关键:要决定每条 message 放哪个 key(LLM 看的格式跟 DB 存的不一样)
     def get_messages_as_conversation(
         self,
         session_id: str,
@@ -2383,6 +2717,9 @@ class SessionDB:
             messages.append(msg)
         return messages
 
+    # 1.56 _session_lineage_root_to_tip — 沿 parent 链走到 tip
+    # 跟 get_compression_tip 区别:返**整条**链,不只 tip
+    # 用途:回放历史要把所有 ancestor 都加载进来
     def _session_lineage_root_to_tip(self, session_id: str) -> List[str]:
         if not session_id:
             return [session_id]
@@ -2406,6 +2743,11 @@ class SessionDB:
         return list(reversed(chain)) or [session_id]
 
     @staticmethod
+    # 1.65 _is_duplicate_replayed_user_message — 检测重复回放
+    # 场景:压缩链回放时,parent 的最后一条 user message 可能跟 child 第一条一样
+    # → 重复显示,LMM 困惑
+    # 比较最后一条 messages[-1] 跟当前 msg 的 content
+    # 命中 → 跳过(去重)
     def _is_duplicate_replayed_user_message(messages: List[Dict[str, Any]], msg: Dict[str, Any]) -> bool:
         if msg.get("role") != "user":
             return False
@@ -2423,6 +2765,14 @@ class SessionDB:
     # Rewind (soft-delete) — see /rewind slash command + issue #21910
     # =========================================================================
 
+    # 1.57 rewind_to_message — 软删某条之后所有 messages
+    # 用途:/rewind N 命令
+    # 实现:UPDATE messages SET active=0 WHERE id >= anchor(不真删)
+    # 软删好处:
+    #   * 还能 /restore_rewound 撤销
+    #   * DB row 还在,FTS 索引能搜到(可选)
+    #   * 不会破坏 message_id 顺序
+    # bump rewind_count 计数
     def rewind_to_message(
         self, session_id: str, target_message_id: int
     ) -> Dict[str, Any]:
@@ -2510,6 +2860,9 @@ class SessionDB:
             "new_head_id": new_head_id,
         }
 
+    # 1.58 restore_rewound — 撤销 rewind
+    # 把 active=0 且 id >= since_message_id 的 messages 翻回 active=1
+    # 跟 rewind_to_message 配对
     def restore_rewound(self, session_id: str, since_message_id: int) -> int:
         """Mark inactive messages with id >= *since_message_id* active again.
 
@@ -2534,6 +2887,10 @@ class SessionDB:
 
         return self._execute_write(_do)
 
+    # 1.59 list_recent_user_messages — 列最近 N 条 user message
+    # 用途:/rewind 选单(让用户选"回到哪条")
+    # 返:(message_id, 短预览)
+    # 软删的(active=0)不返
     def list_recent_user_messages(
         self,
         session_id: str,
@@ -2593,6 +2950,14 @@ class SessionDB:
     # =========================================================================
 
     @staticmethod
+    # 1.66 _sanitize_fts5_query — FTS5 query 防注入
+    # FTS5 MATCH 语法有特殊字符:"OR" "AND" "NEAR" "*" ".." 等
+    # 用户输入直接拼 → 可能解析失败或被注入
+    # 策略:
+    #   1. 双引号包住的短语 → 原样
+    #   2. 含 . 或 - 的 token → 双引号包
+    #   3. 其它 → 当单 term
+    # 配 _is_cjk_codepoint 联合做中文判断
     def _sanitize_fts5_query(query: str) -> str:
         """Sanitize user input for safe use in FTS5 MATCH queries.
 
@@ -2647,6 +3012,15 @@ class SessionDB:
 
 
     @staticmethod
+    # 1.67 _is_cjk_codepoint — 判断 1 个 Unicode 码点是不是 CJK 家族
+    # 覆盖:
+    #   * 0x4E00-0x9FFF  CJK 统一汉字
+    #   * 0x3400-0x4DBF  CJK 扩展 A
+    #   * 0x20000-0x2A6DF CJK 扩展 B
+    #   * 0x3000-0x303F  CJK 符号
+    #   * 0x3040-0x309F  平假名
+    #   * 0x30A0-0x30FF  片假名
+    #   * 0xAC00-0xD7AF  韩文音节
     def _is_cjk_codepoint(cp: int) -> bool:
         return (0x4E00 <= cp <= 0x9FFF or    # CJK Unified Ideographs
                 0x3400 <= cp <= 0x4DBF or    # CJK Extension A
@@ -2657,6 +3031,8 @@ class SessionDB:
                 0xAC00 <= cp <= 0xD7AF)      # Hangul Syllables
 
     @staticmethod
+    # 1.68 _contains_cjk — text 里有 CJK 字符?
+    # 简化:遍历 codepoint,任一命中 _is_cjk_codepoint 就返 True
     def _contains_cjk(text: str) -> bool:
         """Check if text contains CJK (Chinese, Japanese, Korean) characters."""
         for ch in text:
@@ -2672,10 +3048,19 @@ class SessionDB:
         return False
 
     @classmethod
+    # 1.69 _count_cjk — 数 CJK 字符数
+    # 用 sum(1 for c in text if _is_cjk_codepoint(ord(c)))
+    # 跟 len(text) 不同 — 只算 CJK,不算 ASCII
     def _count_cjk(cls, text: str) -> int:
         """Count CJK characters in text."""
         return sum(1 for ch in text if cls._is_cjk_codepoint(ord(ch)))
 
+    # 1.48 search_messages — FTS5 + CJK 回退全文搜索
+    # 主路径:FTS5 MATCH(英文/拉丁文 — 倒排索引,BM25 排序)
+    # CJK 回退:中文/日文/韩文 — FTS5 的 default tokenizer 不分词
+    #   改用 messages_fts_trigram(3 字符 trigram 索引)
+    #   ≥3 字符用 trigram,<3 字符用 LIKE
+    # 配合 _sanitize_fts5_query 转义特殊字符防注入
     def search_messages(
         self,
         query: str,
@@ -2987,6 +3372,9 @@ class SessionDB:
 
         return matches
 
+    # 1.49 search_sessions — session 级别搜索
+    # 跟 search_messages 区别:搜 session 不是 message
+    # 计算 last_active 排序(最近活跃优先)
     def search_sessions(
         self,
         source: str = None,
@@ -3027,6 +3415,9 @@ class SessionDB:
     # Utility
     # =========================================================================
 
+    # 1.50 session_count — 计数 session(可按 source 过滤)
+    # 跟 SELECT COUNT(*) 的区别:可加 min_message_count 阈值
+    # (过滤"空 session"做统计时用)
     def session_count(self, source: str = None, min_message_count: int = 0) -> int:
         """Count sessions, optionally filtered by source."""
         where_clauses = []
@@ -3045,6 +3436,9 @@ class SessionDB:
             cursor = self._conn.execute(f"SELECT COUNT(*) FROM sessions{where_sql}", params)
             return cursor.fetchone()[0]
 
+    # 1.51 message_count — 计数 messages(全局或按 session)
+    # session_id 给的话:只数该 session 的
+    # 不给:数整个表(全局总数)
     def message_count(self, session_id: str = None) -> int:
         """Count messages, optionally for a specific session."""
         with self._lock:
@@ -3060,6 +3454,9 @@ class SessionDB:
     # Export and cleanup
     # =========================================================================
 
+    # 1.52 export_session — 导 1 个 session 全部数据(dict)
+    # 包含 session row + 所有 messages
+    # 用途:备份、调试、用户导出对话
     def export_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Export a single session with all its messages as a dict."""
         session = self.get_session(session_id)
@@ -3068,6 +3465,9 @@ class SessionDB:
         messages = self.get_messages(session_id)
         return {**session, "messages": messages}
 
+    # 1.53 export_all — 导所有 session(可按 source 过滤)
+    # 返 list[dict],每个 dict = 1 个 session + 它所有 messages
+    # 用途:JSONL 备份、跨机器迁移
     def export_all(self, source: str = None) -> List[Dict[str, Any]]:
         """
         Export all sessions (with messages) as a list of dicts.
@@ -3080,6 +3480,10 @@ class SessionDB:
             results.append({**session, "messages": messages})
         return results
 
+    # 1.54 clear_messages — 硬删所有 messages + 重置计数
+    # 跟 soft-delete (rewind) 区别:这是物理 DELETE FROM
+    # 用途:/clear 命令、清空对话但保留 session 行
+    # 同时重置 message_count / tool_call_count = 0
     def clear_messages(self, session_id: str) -> None:
         """Delete all messages for a session and reset its counters."""
         def _do(conn):
@@ -3093,6 +3497,10 @@ class SessionDB:
         self._execute_write(_do)
 
     @staticmethod
+    # 1.60 _remove_session_files — 清磁盘上的 session 文件
+    # DB 之外,sessions/ 目录可能还有 .json / .jsonl / request_dump_* 文件
+    # 删除 session 时**也要**清这些(防孤儿文件)
+    # best-effort:失败不抛(不是关键路径)
     def _remove_session_files(sessions_dir: Optional[Path], session_id: str) -> None:
         """Remove on-disk transcript files for a session.
 
@@ -3119,6 +3527,10 @@ class SessionDB:
         except OSError:
             pass
 
+    # 1.61 delete_session — 删 1 个 session + 它的 messages
+    # 重要:不级联删 child sessions — 设 parent_session_id = NULL
+    # (orphan children,稍后 prune_sessions 清)
+    # 还要调 _remove_session_files 清磁盘文件
     def delete_session(
         self,
         session_id: str,
@@ -3153,6 +3565,10 @@ class SessionDB:
             self._remove_session_files(sessions_dir, session_id)
         return deleted
 
+    # 1.62 prune_sessions — 批量删过期 session
+    # 策略:删 ended_at > N 天的 session
+    # 同样 orphan 它的 children + 清磁盘文件
+    # 用途:maybe_auto_prune_and_vacuum(启动时跑)
     def prune_sessions(
         self,
         older_than_days: int = 90,
@@ -3210,6 +3626,9 @@ class SessionDB:
 
     # ── Meta key/value (for scheduler bookkeeping) ──
 
+    # 1.39 get_meta — 从 state_meta 读 KV
+    # 用途:scheduler / watchdog 存小数据(如 "last_kanban_run_ts": "...")
+    # 返字符串值 / None
     def get_meta(self, key: str) -> Optional[str]:
         """Read a value from the state_meta key/value store."""
         with self._lock:
@@ -3220,6 +3639,9 @@ class SessionDB:
             return None
         return row["value"] if isinstance(row, sqlite3.Row) else row[0]
 
+    # 1.40 set_meta — 写 state_meta KV(upsert)
+    # INSERT ... ON CONFLICT DO UPDATE:存在则覆盖,不存在则新建
+    # 走 _execute_write 走事务(防并发覆盖)
     def set_meta(self, key: str, value: str) -> None:
         """Write a value to the state_meta key/value store."""
         def _do(conn):
@@ -3230,6 +3652,10 @@ class SessionDB:
             )
         self._execute_write(_do)
 
+    # 1.70 apply_telegram_topic_migration — Telegram DM topic 模式迁移
+    # 用途:Telegram DM 用 topic 区分对话时,要建专门的 binding 表
+    # + 加外键 ON DELETE CASCADE
+    # 只跑 1 次,版本门控(idempotent)
     def apply_telegram_topic_migration(self) -> None:
         """Create Telegram DM topic-mode tables on explicit /topic opt-in.
 
@@ -3330,6 +3756,8 @@ class SessionDB:
             )
         self._execute_write(_do)
 
+    # 1.80 enable_telegram_topic_mode — 启用 topic 模式(给某个 chat/user)
+    # 持久化 capability flag
     def enable_telegram_topic_mode(
         self,
         *,
@@ -3379,6 +3807,8 @@ class SessionDB:
             )
         self._execute_write(_do)
 
+    # 1.81 disable_telegram_topic_mode — 关闭 topic 模式
+    # 可选:clear_bindings=True 时,把所有 (chat_id, thread_id) 绑定清掉
     def disable_telegram_topic_mode(
         self,
         *,
@@ -3412,6 +3842,7 @@ class SessionDB:
                 return
         self._execute_write(_do)
 
+    # 1.82 is_telegram_topic_mode_enabled — 查某 chat/user topic 模式开了?
     def is_telegram_topic_mode_enabled(self, *, chat_id: str, user_id: str) -> bool:
         """Return whether Telegram DM topic mode is enabled for this chat/user."""
         with self._lock:
@@ -3430,6 +3861,7 @@ class SessionDB:
         enabled = row["enabled"] if isinstance(row, sqlite3.Row) else row[0]
         return bool(enabled)
 
+    # 1.83 get_telegram_topic_binding — 按 (chat_id, thread_id) 查绑定
     def get_telegram_topic_binding(
         self,
         *,
@@ -3450,6 +3882,8 @@ class SessionDB:
                 return None
         return dict(row) if row else None
 
+    # 1.84 list_telegram_topic_bindings_for_chat — 列某 chat 全部 binding
+    # 按时间倒序(最新在前)
     def list_telegram_topic_bindings_for_chat(
         self,
         *,
@@ -3471,6 +3905,8 @@ class SessionDB:
                 return []
         return [dict(row) for row in rows]
 
+    # 1.85 get_telegram_topic_binding_by_session — 反向查(sessions → topic)
+    # 用 UNIQUE index 加速(一个 session 只能绑一个 topic)
     def get_telegram_topic_binding_by_session(
         self,
         *,
@@ -3495,6 +3931,8 @@ class SessionDB:
                 return None
         return dict(row) if row else None
 
+    # 1.86 bind_telegram_topic — 绑 1 个 session 到 1 个 Telegram topic
+    # 拒绝"双绑":同一 session 只能绑一个 topic(UNIQUE 约束)
     def bind_telegram_topic(
         self,
         *,
@@ -3559,6 +3997,8 @@ class SessionDB:
             )
         self._execute_write(_do)
 
+    # 1.87 is_telegram_session_linked_to_topic — session 已绑 topic?
+    # 只读,不做迁移
     def is_telegram_session_linked_to_topic(self, *, session_id: str) -> bool:
         """Return True if a Hermes session is already bound to any Telegram DM topic.
 
@@ -3581,6 +4021,8 @@ class SessionDB:
                 return False
         return row is not None
 
+    # 1.88 list_unlinked_telegram_sessions_for_user — 列未绑 topic 的老 session
+    # 用途:用户开了 topic 模式后,帮它把老 session 选一个绑
     def list_unlinked_telegram_sessions_for_user(
         self,
         *,
@@ -3672,6 +4114,10 @@ class SessionDB:
         except sqlite3.OperationalError:
             return False
 
+    # 1.71 optimize_fts — FTS5 b-tree segment 合并
+    # FTS5 写多了会产生很多小 segment → 搜索变慢
+    # INSERT INTO messages_fts(messages_fts, 'optimize') 触发合并
+    # 返修了几个 FTS index(应该是 1)
     def optimize_fts(self) -> int:
         """Merge fragmented FTS5 b-tree segments into one per index.
 
@@ -3711,6 +4157,10 @@ class SessionDB:
                     )
         return optimized
 
+    # 1.72 vacuum — 回收 SQLite 文件空间
+    # 大量 DELETE 后,DB 文件不会自动缩(VACUUM 才会)
+    # 慢、占 I/O,不该频繁跑
+    # 配合 optimize_fts 用 — 清理完碎片再 vacuum
     def vacuum(self) -> int:
         """Run VACUUM to reclaim disk space after large deletes.
 
@@ -3749,6 +4199,12 @@ class SessionDB:
             self._conn.execute("VACUUM")
         return optimized
 
+    # 1.73 maybe_auto_prune_and_vacuum — 启动时自动维护
+    # 跑顺序:
+    #   1. prune_empty_ghost_sessions(24h 前的空 TUI)
+    #   2. finalize_orphaned_compression_sessions(7d 前的孤儿)
+    #   3. 周期到了才 vacuum(防止每次启动都跑)
+    # 启动慢的时候可能就是这个跑的
     def maybe_auto_prune_and_vacuum(
         self,
         retention_days: int = 90,
@@ -3834,6 +4290,10 @@ class SessionDB:
     # The CLI writes "pending" then poll-waits for terminal state. The gateway
     # watcher transitions pending→running→{completed,failed}.
 
+    # 1.74 request_handoff — 跨平台交接请求
+    # 用途:CLI 的对话要"交接"到 Telegram / Discord 等
+    # 状态机:None → pending → running → completed / failed
+    # 返 True = 成功标记 pending(其他状态会拒绝)
     def request_handoff(self, session_id: str, platform: str) -> bool:
         """Mark a session as pending handoff to the given platform.
 
@@ -3853,6 +4313,8 @@ class SessionDB:
             return cur.rowcount > 0
         return self._execute_write(_do)
 
+    # 1.75 get_handoff_state — 查交接状态
+    # 返:{state, platform, error} / None(没交接)
     def get_handoff_state(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Read the current handoff state for a session.
 
@@ -3876,6 +4338,9 @@ class SessionDB:
         except Exception:
             return None
 
+    # 1.76 list_pending_handoffs — gateway watcher 找待处理交接
+    # 返所有 state=pending 的,按时间排(最老的先)
+    # gateway 周期性扫这个表,自己 claim 然后处理
     def list_pending_handoffs(self) -> List[Dict[str, Any]]:
         """Return all sessions in handoff_state='pending', oldest first.
 
@@ -3891,6 +4356,9 @@ class SessionDB:
         except Exception:
             return []
 
+    # 1.77 claim_handoff — gateway 原子认领交接
+    # pending → running 转换,原子
+    # 返 True = 认领成功(自己来跑)/ False = 别人抢先了
     def claim_handoff(self, session_id: str) -> bool:
         """Atomically transition pending → running. Returns True if claimed."""
         def _do(conn):
@@ -3902,6 +4370,8 @@ class SessionDB:
             return cur.rowcount > 0
         return self._execute_write(_do)
 
+    # 1.78 complete_handoff — 标记交接完成
+    # running → completed,清 error
     def complete_handoff(self, session_id: str) -> None:
         """Mark a handoff as completed."""
         def _do(conn):
@@ -3912,6 +4382,8 @@ class SessionDB:
             )
         self._execute_write(_do)
 
+    # 1.79 fail_handoff — 标记交接失败
+    # running → failed,记 error(截断 500 字符)
     def fail_handoff(self, session_id: str, error: str) -> None:
         """Mark a handoff as failed and record the reason."""
         def _do(conn):

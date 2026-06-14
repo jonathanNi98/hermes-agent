@@ -2,22 +2,28 @@
 """
 Model Tools Module
 
-Thin orchestration layer over the tool registry. Each tool file in tools/
-self-registers its schema, handler, and metadata via tools.registry.register().
-This module triggers discovery (by importing all tool modules), then provides
-the public API that run_agent.py, cli.py, batch_runner.py, and the RL
-environments consume.
-
-Public API (signatures preserved from the original 2,400-line version):
-    get_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode) -> list
-    handle_function_call(function_name, function_args, task_id, user_task) -> str
-    TOOL_TO_TOOLSET_MAP: dict          (for batch_runner.py)
-    TOOLSET_REQUIREMENTS: dict         (for cli.py, doctor.py)
-    get_all_tool_names() -> list
-    get_toolset_for_tool(name) -> str
-    get_available_toolsets() -> dict
-    check_toolset_requirements() -> dict
-    check_tool_availability(quiet) -> tuple
+# === 这个文件是干什么的? ===
+# 是 tools/registry.py 上面的一层"对外门面",也是 agent 主循环调用工具的入口。
+# 每个工具文件在 tools/ 目录下,import 时调 registry.register() 自注册;
+# 这个模块在模块加载时(import 阶段)就触发 discover_builtin_tools() 把
+# 80+ 个工具文件都 import 一遍,让它们把 schema/handler 塞进全局 registry。
+#
+# === 跟 registry.py 的关系 ===
+# tools/registry.py    底层:数据存储 + 增删改查
+# model_tools.py      上层:对外门面(主循环、CLI、RL 环境都 import 这个)
+# 关系:本文件 import registry,反过来 registry 通过 lazy import
+#      调本文件的 _run_async(避免循环 import)
+#
+# === 公共 API(签名保持兼容老 2400 行版本) ===
+#     get_tool_definitions(enabled, disabled, quiet)         # 给 LLM 拼 tool schema
+#     handle_function_call(name, args, task_id, user_task)   # 执行工具
+#     TOOL_TO_TOOLSET_MAP / TOOLSET_REQUIREMENTS             # 兼容老代码的模块级常量
+#     get_all_tool_names() / get_toolset_for_tool(name) ...  # 查询 helper
+#
+# === 三大设计要点(看完整个文件回头看) ===
+# 1. Async 桥接:_run_async 把 async handler 塞进同步主循环
+# 2. 多层缓存:tool defs 缓存 + check_fn TTL 缓存 + generation counter
+# 3. 容错:参数类型纠正、错误清洗、未知工具降级
 """
 
 import os
@@ -38,10 +44,24 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 # Async Bridging  (single source of truth -- used by registry.dispatch too)
 # =============================================================================
+#
+# === 为什么需要这一层? ===
+# 1. agent 主循环(run_agent.py)是同步的,但有些工具(handler)是 async def
+# 2. 主循环直接 await 会卡死(没有运行中的 loop)
+# 3. asyncio.run() 又会"建 loop → 跑 → 关 loop",导致缓存的 httpx/AsyncOpenAI
+#    客户端在 GC 时尝试 close 它们的 transport,transport 绑在已死的 loop 上
+#    → 抛 "Event loop is closed"
+#
+# === 解决方案:持久化的 loop ===
+# 主线程一个 loop(全程不关),工作线程(并行工具执行)每个线程一个 loop
+# 这样异步客户端的 transport 一直绑在"活的 loop"上,GC 清理时不会炸。
 
-_tool_loop = None          # persistent loop for the main (CLI) thread
+# 主线程的持久 loop(被多个工具调用共享)
+_tool_loop = None
 _tool_loop_lock = threading.Lock()
-_worker_thread_local = threading.local()  # per-worker-thread persistent loops
+
+# 工作线程的持久 loop(threading.local 让每个线程有自己的一份)
+_worker_thread_local = threading.local()
 
 
 def _get_tool_loop():
@@ -51,6 +71,10 @@ def _get_tool_loop():
     *closes* a fresh loop every time) prevents "Event loop is closed"
     errors that occur when cached httpx/AsyncOpenAI clients attempt to
     close their transport on a dead loop during garbage collection.
+
+    # === 双重检查锁 ===
+    # 先无锁判断 → 锁内再判断 → 创建/复用
+    # 锁粒度:只保护"创建 loop"这一句,后续调用 99% 走快路径(无锁)
     """
     global _tool_loop
     with _tool_loop_lock:
@@ -72,6 +96,15 @@ def _get_worker_loop():
 
     By keeping the loop alive for the thread's lifetime, cached clients
     stay valid and their cleanup runs on a live loop.
+
+    # === threading.local 的妙用 ===
+    # 每个 worker 线程第一次调这个函数时,threading.local 给它分配一个属性"loop"。
+    # 后续调用直接从 thread-local 拿,O(1) 不需要任何全局锁。
+    # 线程结束时 loop 不主动关(让它跟线程一起死)。
+    #
+    # === asyncio.set_event_loop 的作用 ===
+    # 让 `asyncio.get_event_loop()` 在这个线程里也返这个 loop,
+    # 兼容"老代码隐式假设线程有默认 loop"的场景。
     """
     loop = getattr(_worker_thread_local, 'loop', None)
     if loop is None or loop.is_closed():
@@ -100,21 +133,35 @@ def _run_async(coro):
 
     This is the single source of truth for sync->async bridging in tool
     handlers. Each handler is self-protecting via this function.
+
+    # === 三分支:按"当前线程的环境"决定怎么跑 coroutine ===
+    # 分支 1:当前线程已经有 running loop(gateway / RL env)
+    #         → 不能 reuse(冲突),扔到一次性 thread,自建 loop,跑完销毁
+    # 分支 2:在 worker 线程(非主线程)上
+    #         → 用线程本地的持久 loop(避免和主线程 loop 抢,也避免 asyncio.run 销毁)
+    # 分支 3:在主线程,没有 running loop(最常见的 CLI 路径)
+    #         → 用主线程的持久 loop
     """
+    # === 探测"当前线程有没有正在运行的 loop" ===
+    # get_running_loop() 在没有 loop 的线程里会抛 RuntimeError
+    # 用 try/except 兜底,跟 Rust 的 unwrap_or 一样
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         loop = None
 
     if loop and loop.is_running():
-        # Inside an async context (gateway, RL env) — run in a fresh thread
-        # with its own event loop we own a reference to, so on timeout we
-        # can cancel the task inside that loop (ThreadPoolExecutor.cancel()
-        # only works on not-yet-started futures — it's a no-op on a running
-        # worker, which previously leaked the thread on every 300 s timeout).
+        # === 分支 1:在 async 上下文里(gateway / RL env) ===
+        # 不能再用 caller 的 loop(会冲突 / 死锁)
+        # 也不能用主线程的持久 loop(同一个进程 = 同一个 loop)
+        # 解决:开一个一次性 ThreadPoolExecutor,里面 new_event_loop
+        # 优点:这个 worker loop 由我们持有引用,timeout 时能 cancel 它
+        #      (以前用 ThreadPoolExecutor.cancel() 只能取消未启动的 future,
+        #      对 running 任务无效,导致 300s 超时每次都泄漏一个线程)
         import concurrent.futures
 
         worker_loop: Optional[asyncio.AbstractEventLoop] = None
+        # Event 用于同步"worker loop 准备好了",避免 timeout cancel 时 race condition
         loop_ready = threading.Event()
 
         def _run_in_worker():
@@ -126,8 +173,8 @@ def _run_async(coro):
                 return worker_loop.run_until_complete(coro)
             finally:
                 try:
-                    # Cancel anything still pending (e.g. task cancelled
-                    # externally via call_soon_threadsafe on timeout).
+                    # 把所有还在 pending 的 task 都 cancel,然后跑一次 gather 等它们真死
+                    # 这样 worker_loop 关闭时不会有"半挂"任务
                     pending = asyncio.all_tasks(worker_loop)
                     for t in pending:
                         t.cancel()
@@ -142,33 +189,34 @@ def _run_async(coro):
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         future = pool.submit(_run_in_worker)
         try:
+            # 5 分钟硬超时(300s)——给长时间运行的工具足够的预算
             return future.result(timeout=300)
         except concurrent.futures.TimeoutError:
-            # Cancel the coroutine inside its own loop so the worker thread
-            # can wind down instead of running forever.
+            # === 超时处理 ===
+            # 等 worker 起来(wait 是 blocking 但最多 1 秒),拿到它的 loop 引用
             if loop_ready.wait(timeout=1.0) and worker_loop is not None:
                 try:
+                    # call_soon_threadsafe 从别的线程安全地调度 cancel
                     for t in asyncio.all_tasks(worker_loop):
                         worker_loop.call_soon_threadsafe(t.cancel)
                 except RuntimeError:
-                    # Loop already closed — nothing to cancel.
+                    # Loop 已经关了,啥都不用做
                     pass
             raise
         finally:
-            # wait=False: don't block the caller on a stuck coroutine. We've
-            # already requested cancellation above; the worker will exit
-            # once the coroutine observes it (usually at the next await).
+            # wait=False:不阻塞 caller 等待线程结束。我们已经发起 cancel 了,
+            # 线程会在 coroutine 下次 await 时退出。
             pool.shutdown(wait=False)
 
-    # If we're on a worker thread (e.g., parallel tool execution in
-    # delegate_task), use a per-thread persistent loop.  This avoids
-    # contention with the main thread's shared loop while keeping cached
-    # httpx/AsyncOpenAI clients bound to a live loop for the thread's
-    # lifetime — preventing "Event loop is closed" on GC cleanup.
+    # === 分支 2:在 worker 线程(非主线程)上 ===
+    # 比如 delegate_task 在 ThreadPoolExecutor 里跑并行工具。
+    # 用线程本地的持久 loop——既不和主线程抢,也避免 asyncio.run 的销毁问题
     if threading.current_thread() is not threading.main_thread():
         worker_loop = _get_worker_loop()
         return worker_loop.run_until_complete(coro)
 
+    # === 分支 3:在主线程,无 running loop(常见 CLI 路径) ===
+    # 走持久 loop,这样 async 客户端的 transport 一直绑在活 loop 上
     tool_loop = _get_tool_loop()
     return tool_loop.run_until_complete(coro)
 
@@ -203,20 +251,40 @@ except Exception as e:
 # =============================================================================
 # Backward-compat constants  (built once after discovery)
 # =============================================================================
+#
+# === 这两个模块级常量是给老代码吃的"形状兼容层" ===
+# 老 API 期望 `model_tools.TOOL_TO_TOOLSET_MAP` / `model_tools.TOOLSET_REQUIREMENTS`
+# 这两个常量在模块加载时一次性算出来。
+#
+# ⚠️ 静态:这两个变量在 import 时一次性算。如果用户中途 register 新工具,
+# 这个常量不会自动更新。所以新代码应该直接调 registry.get_*() 方法。
+# 留着这两个只是为了不破坏老 API。
 
+# {tool_name: toolset_name} 的扁平映射——给 batch_runner.py 用
 TOOL_TO_TOOLSET_MAP: Dict[str, str] = registry.get_tool_to_toolset_map()
 
+# {toolset_name: {name, env_vars, check_fn, setup_url, tools}}——给 cli.py / doctor.py 用
 TOOLSET_REQUIREMENTS: Dict[str, dict] = registry.get_toolset_requirements()
 
-# Resolved tool names from the last get_tool_definitions() call.
-# Used by code_execution_tool to know which tools are available in this session.
+# === "上一次"解析出的工具名 ===
+# _last_resolved_tool_names 在 get_tool_definitions() 每次被调时更新。
+# 谁在看?code_execution_tool——它需要在沙箱里"列举当前 session 可用工具",
+# 跟主进程保持一致。模块级变量是"最近一次"的快照,够用。
 _last_resolved_tool_names: List[str] = []
 
 
 # =============================================================================
 # Legacy toolset name mapping  (old _tools-suffixed names -> tool name lists)
 # =============================================================================
-
+#
+# === 老 API 的 toolset 名 → 新 API 的工具名列表 ===
+# 早期(2400 行版本)用"功能区"作为分组单位,名字带 _tools 后缀:
+#   "web_tools" 包含 ["web_search", "web_extract"]
+#   "browser_tools" 包含 ["browser_navigate", "browser_click", ...]
+# 新 API 直接用 toolset 名(单数,不带 _tools),toolsets/ 模块里定义。
+#
+# 这张表是给老配置文件 / 老用户命令用的"翻译器":
+#   用户说"启用 web_tools" → 查表 → 真正启用 ["web_search", "web_extract"]
 _LEGACY_TOOLSET_MAP = {
     "web_tools": ["web_search", "web_extract"],
     "terminal_tools": ["terminal"],
@@ -239,25 +307,44 @@ _LEGACY_TOOLSET_MAP = {
 # =============================================================================
 # get_tool_definitions  (the main schema provider)
 # =============================================================================
-
-# Module-level memoization for get_tool_definitions(). Keyed on
-# (frozenset(enabled_toolsets), frozenset(disabled_toolsets), registry._generation).
-# Hot callers (gateway runner, AIAgent.__init__) invoke this on every turn
-# with quiet_mode=True; caching avoids ~7 ms of registry walking + schema
-# filtering + check_fn probing per call. Only active when quiet_mode=True
-# because quiet_mode=False has stdout side effects (tool-selection prints).
 #
-# Invalidation happens transparently via the registry's _generation counter,
-# which bumps on register() / deregister() / register_toolset_alias(). The
-# inner check_fn TTL cache in registry.py handles environment drift (Docker
-# daemon start/stop, env var changes, etc.) on a 30 s horizon.
+# === 这个模块的"主入口" ===
+# 整个 agent 的工具系统对外就这一个函数,主循环每 turn 都会调它:
+#     tools = get_tool_definitions(enabled, disabled, quiet=True)
+#     messages = build_messages(..., tools=tools, ...)
+# 它决定"这一轮对话,LLM 看到哪些工具可选"。
+
+# === 缓存 ===
+# 缓存 key: (frozenset(enabled), frozenset(disabled), registry._generation)
+# 缓存值: List[Dict]  # 完整的 OpenAI-format 工具 schema 列表
+#
+# 为什么需要缓存?
+#   - 每次调都要走 registry 遍历 + check_fn 探测 + schema 过滤 ≈ 7ms
+#   - gateway / AIAgent 每个 turn 都调一次(每秒可能几十次)
+#   - 没缓存的话,光工具发现就吃光 CPU
+#
+# 何时失效?(三重保险)
+#   1. registry._generation 变化(register / deregister 触发)
+#   2. enabled/disabled 变化(用户改配置)
+#   3. 配置文件 mtime 变化(dynamic schema 依赖配置)
+#
+# 为什么只在 quiet_mode=True 时缓存?
+#   quiet_mode=False 时,函数内部会 print 工具选择过程(给用户看"我用了哪些工具")。
+#   缓存后这部分打印就跳过——破坏 UX。所以非 quiet 模式不缓存。
 _tool_defs_cache: Dict[tuple, List[Dict[str, Any]]] = {}
 
 
 def _clear_tool_defs_cache() -> None:
     """Drop memoized get_tool_definitions() results. Called when dynamic
     schema dependencies change (e.g. discord capability cache reset,
-    execute_code sandbox reconfigured)."""
+    execute_code sandbox reconfigured).
+
+    # === 什么时候外部要主动失效? ===
+    # 当 dynamic_schema_overrides 依赖的状态变了,但配置文件没变时:
+    #   - discord 的 capability 缓存被重置
+    #   - execute_code 的 sandbox 模式从 local 切到 docker
+    #   - 任何不在配置文件 mtime 范围内的"运行时状态"变更
+    """
     _tool_defs_cache.clear()
 
 
@@ -284,6 +371,16 @@ def get_tool_definitions(
 
     Returns:
         Filtered list of OpenAI-format tool definitions.
+
+    # === 这个函数的核心职责 ===
+    # 1. 按 enabled/disabled toolset 过滤可用工具
+    # 2. 应用 tool_search 组装(当工具太多,只暴露"搜索"入口)
+    # 3. 应用 LCM 标签筛选(本地模型减负)
+    # 4. 返回 OpenAI 格式 schema 列表
+    #
+    # === 缓存策略 ===
+    # quiet_mode=True 时走缓存(性能),quiet_mode=False 时不走(要 print)。
+    # 缓存 key 包含 6 个分量,任一变化都让缓存自动失效。
     """
     # Fast path: memoized result when the caller doesn't need stdout prints.
     # The cache key captures every argument-level input; the registry
@@ -311,17 +408,27 @@ def get_tool_definitions(
         )
         cached = _tool_defs_cache.get(cache_key)
         if cached is not None:
-            # Update _last_resolved_tool_names so downstream callers see
-            # consistent state even on a cache hit.
+            # === 缓存命中 ===
+            # 同样要更新 _last_resolved_tool_names,让下游 caller
+            # (比如 code_execution_tool)看到一致状态
             global _last_resolved_tool_names
             _last_resolved_tool_names = [t["function"]["name"] for t in cached]
             # Return a shallow copy of the list but share the dict references —
             # schemas are treated as read-only by all known callers.
+            # 为什么 shallow copy?caller 可能 append / extend 这个 list,
+            # 我们不想污染缓存。
             return list(cached)
 
     result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
                                        skip_tool_search_assembly=skip_tool_search_assembly)
     if quiet_mode:
+        # === 缓存未命中 → 算 → 写缓存 → 返 shallow copy ===
+        # 同样要 shallow copy:issue #17335 修过这个 bug。
+        # 老代码会 `self.tools = get_tool_definitions(...)` 然后 `self.tools.append(memory_tool)`。
+        # 如果不 copy,append 的结果会污染缓存,
+        # 下一个 turn 拿到的是"已经 append 过 memory_tool 的版本",
+        # 再 append 又多一个,Gateway 长期跑下来,工具名重复累积,
+        # DeepSeek / MiMo / Kimi 这种"严格去重"的 provider 就会 400 报错。
         # Cache the freshly-computed list, but hand callers a shallow copy so
         # downstream mutations (e.g. run_agent appending memory/LCM tool
         # schemas to self.tools) don't poison the cache. Without this, a
@@ -340,11 +447,31 @@ def _compute_tool_definitions(
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
 ) -> List[Dict[str, Any]]:
-    """Uncached implementation of :func:`get_tool_definitions`."""
-    # Determine which tool names the caller wants
+    """Uncached implementation of :func:`get_tool_definitions`.
+
+    # === 这个函数分 7 步 ===
+    # 1. 解析 enabled_toolsets → 候选工具集合(用 set 防重)
+    # 2. 应用 disabled_toolsets 做差集(后减,避免 disabled 被 enabled 覆盖)
+    # 3. 调 registry.get_definitions(自动跑 check_fn 过滤)
+    # 4. 动态调整:execute_code / discord / browser 等 schema(随运行时配置)
+    # 5. print 一行总览
+    # 6. 全局 sanitize(给 llama.cpp 兼容)
+    # 7. Tool Search 组装(工具太多 → 用 3 个桥接工具代理)
+    #
+    # === Kanban worker 强制注入 ===
+    # 看到环境变量 HERMES_KANBAN_TASK 存在,就强制把 "kanban" 工具集
+    # 加进 enabled——dispatcher spawn 的 worker 必须能 complete / block / heartbeat,
+    # 即使 assignee profile 限制了其他 toolset。
+    """
+    # ════════════════════════════════════════════════════════════════
+    # Step 1: 解析 enabled_toolsets → 候选工具集合
+    # ════════════════════════════════════════════════════════════════
+    # 用 set 防重;老 API 名(_tools 后缀)走 _LEGACY_TOOLSET_MAP 翻译;
+    # 未知 toolset 仅 print warning,不抛异常(容错)
     tools_to_include: set = set()
 
     if enabled_toolsets is not None:
+        # === Kanban worker 强制注入(见 docstring) ===
         effective_enabled_toolsets = list(enabled_toolsets)
         if os.environ.get("HERMES_KANBAN_TASK") and "kanban" not in effective_enabled_toolsets:
             # Dispatcher-spawned workers are scoped by HERMES_KANBAN_TASK and
@@ -354,11 +481,13 @@ def _compute_tool_definitions(
             # worker's completion/block/heartbeat surface.
             effective_enabled_toolsets.append("kanban")
         for toolset_name in effective_enabled_toolsets:
+            # 优先用新 API 验证 + 解析 toolset 名
             if validate_toolset(toolset_name):
                 resolved = resolve_toolset(toolset_name)
                 tools_to_include.update(resolved)
                 if not quiet_mode:
                     print(f"✅ Enabled toolset '{toolset_name}': {', '.join(resolved) if resolved else 'no tools'}")
+            # 兜底:老 API 名字(_tools 后缀)查 _LEGACY_TOOLSET_MAP
             elif toolset_name in _LEGACY_TOOLSET_MAP:
                 legacy_tools = _LEGACY_TOOLSET_MAP[toolset_name]
                 tools_to_include.update(legacy_tools)
@@ -367,11 +496,22 @@ def _compute_tool_definitions(
             elif not quiet_mode:
                 print(f"⚠️  Unknown toolset: {toolset_name}")
     else:
+        # === 默认:全部工具都开 ===
+        # 比如用户没指定 enabled,就把所有已注册 toolset 的工具都拉进来
         # Default: start with everything
         from toolsets import get_all_toolsets
         for ts_name in get_all_toolsets():
             tools_to_include.update(resolve_toolset(ts_name))
 
+    # ════════════════════════════════════════════════════════════════
+    # Step 2: 应用 disabled_toolsets 做差集
+    # ════════════════════════════════════════════════════════════════
+    # 关键:disabled 是后减,不是"先减"
+    # 顺序是 enabled ∪ ... \ disabled
+    # 这样如果用户 enabled 了一个大 toolset(包含很多子工具),但同时
+    # disabled 了其中某些具体 toolset,disabled 的会"穿透"出来。
+    # issue #17309 修过这个 bug:之前 disabled 在 enabled 之前算,
+    # 导致 enabled 里的"覆盖了"disabled 的工具集。
     # Always apply disabled toolsets as a subtraction step at the end.
     # This ensures that even if a composite toolset (like hermes-cli)
     # is enabled, any tools belonging to a disabled toolset are strictly
@@ -391,6 +531,16 @@ def _compute_tool_definitions(
             elif not quiet_mode:
                 print(f"⚠️  Unknown toolset: {toolset_name}")
 
+    # ════════════════════════════════════════════════════════════════
+    # Step 3: 调 registry.get_definitions(自动跑 check_fn 过滤)
+    # ════════════════════════════════════════════════════════════════
+    # registry 会做:
+    #   1. 从 set 里取每个 tool name
+    #   2. 跑 entry.check_fn() → 失败的工具被过滤(无 check_fn 的默认通过)
+    #   3. 拼 OpenAI 格式 `{"type": "function", "function": {...}}`
+    #   4. 应用 dynamic_schema_overrides(运行时改 schema)
+    # 返回 filtered_tools: 只包含 check_fn 通过的工具 schema 列表
+    #
     # Plugin-registered tools are now resolved through the normal toolset
     # path — validate_toolset() / resolve_toolset() / get_all_toolsets()
     # all check the tool registry for plugin-provided toolsets.  No bypass
@@ -406,6 +556,24 @@ def _compute_tool_definitions(
     # descriptions that don't actually exist, and hallucinates calls to them.
     available_tool_names = {t["function"]["name"] for t in filtered_tools}
 
+    # ════════════════════════════════════════════════════════════════
+    # Step 4: 动态 schema 调整(随运行时配置 / 环境探测)
+    # ════════════════════════════════════════════════════════════════
+    # 这一步要解决的核心问题:
+    #   工具的 description / parameters 里有"提到其他工具名"的地方
+    #   (比如 execute_code 说"可以调 web_search / web_extract")。
+    #   如果提到的工具实际上不可用(check_fn 不过、没启用),模型会
+    #   调一个"幻觉工具"。所以要按 available_tool_names 动态改写。
+    #
+    # 涉及 3 个工具:execute_code / discord / discord_admin / browser_navigate
+
+    # ════════════════════════════════════════════════════════════════
+    # Step 4a: 重构 execute_code 的 schema
+    # ════════════════════════════════════════════════════════════════
+    # 静态 schema 列出"沙箱内可调的工具"(默认全开),但实际可能
+    # 有些工具没装(API key 缺)/ 被 disabled。按 available_tool_names
+    # 重写,只暴露真正可用的。否则模型会在沙箱里调一个空工具。
+    # issue:#560-discord
     # Rebuild execute_code schema to only list sandbox tools that are actually
     # available.  Without this, the model sees "web_search is available in
     # execute_code" even when the API key isn't configured or the toolset is
@@ -419,6 +587,14 @@ def _compute_tool_definitions(
                 filtered_tools[i] = {"type": "function", "function": dynamic_schema}
                 break
 
+    # ════════════════════════════════════════════════════════════════
+    # Step 4b: 重构 discord / discord_admin 的 schema
+    # ════════════════════════════════════════════════════════════════
+    # 静态 schema 列出所有 discord action,但实际:
+    #   - 某些 action 需要 bot 有特定 intent(去 GET /applications/@me 探测)
+    #   - 用户在 config 里可能设了"允许的 action 白名单"
+    # 动态 schema 只暴露 bot 真正能用、用户允许用的 action,
+    # 否则模型会调一个 Discord API 拒绝的 action。
     # Rebuild discord / discord_admin schemas based on the bot's privileged
     # intents (detected from GET /applications/@me) and the user's action
     # allowlist in config.  Hides actions the bot's intents don't support so
@@ -448,6 +624,12 @@ def _compute_tool_definitions(
                         filtered_tools[i] = {"type": "function", "function": dynamic}
                         break
 
+    # ════════════════════════════════════════════════════════════════
+    # Step 4c: 清理 browser_navigate 的 description
+    # ════════════════════════════════════════════════════════════════
+    # 静态 description 说"推荐用 web_search / web_extract(更快更便宜)"
+    # 但如果这两个工具没开,模型会幻觉去调它们。
+    # 修法:从 description 里把这一句删掉。
     # Strip web tool cross-references from browser_navigate description when
     # web_search / web_extract are not available.  The static schema says
     # "prefer web_search or web_extract" which causes the model to hallucinate
@@ -468,6 +650,10 @@ def _compute_tool_definitions(
                     }
                     break
 
+    # ════════════════════════════════════════════════════════════════
+    # Step 5: print 一行总览(给用户看"这一轮用了哪些工具")
+    # ════════════════════════════════════════════════════════════════
+    # 非 quiet 模式下,在终端 print 一行 🛠️ emoji 开头的总结
     if not quiet_mode:
         if filtered_tools:
             tool_names = [t["function"]["name"] for t in filtered_tools]
@@ -475,9 +661,21 @@ def _compute_tool_definitions(
         else:
             print("🛠️  No tools selected (all filtered out or unavailable)")
 
+    # 把"这一轮解析出的工具名"塞进模块级变量,给 code_execution_tool 看
     global _last_resolved_tool_names
     _last_resolved_tool_names = [t["function"]["name"] for t in filtered_tools]
 
+    # ════════════════════════════════════════════════════════════════
+    # Step 6: 全局 sanitize(给 llama.cpp 兼容)
+    # ════════════════════════════════════════════════════════════════
+    # 不同后端对 JSON schema 的容忍度不一样:
+    #   - 云厂商(OpenAI/Anthropic)宽容,基本啥都接
+    #   - llama.cpp 严格:用 schema 编译 GBNF 语法,某些 shape 直接拒
+    #     例如 bare `"type": "object"` 没 properties 会被拒
+    #     字符串值的 schema 节点(从某些有 bug 的 MCP server 来)也会被拒
+    #
+    # sanitize_tool_schemas 把这些 corner case 规范化掉。
+    # 对已合规的 schema 是 no-op。
     # Sanitize schemas for broad backend compatibility. llama.cpp's
     # json-schema-to-grammar converter (used by its OAI server to build
     # GBNF tool-call parsers) rejects some shapes that cloud providers
@@ -490,6 +688,21 @@ def _compute_tool_definitions(
     except Exception as e:  # pragma: no cover — defensive
         logger.warning("Schema sanitization skipped: %s", e)
 
+    # ════════════════════════════════════════════════════════════════
+    # Step 7: Tool Search 组装(工具太多 → 用 3 个桥接工具代理)
+    # ════════════════════════════════════════════════════════════════
+    # 背景:用户开了 50+ 工具(MCP 拉一堆 server + 各种 plugin),
+    # 把所有 schema 灌进 prompt 一次,光工具列表就吃掉 10%+ context。
+    # 解法:渐进式披露(progressive disclosure)
+    #   - 核心工具(toolsets._HERMES_CORE_TOOLS)永远直接给 LLM
+    #   - 周边工具(MCP / plugin)替换成 3 个桥接工具:
+    #       tool_search(query) → 找匹配的工具
+    #       tool_describe(name) → 看某个工具的 schema
+    #       tool_call(name, args) → 间接调用那个工具
+    #   - 阈值:deferrable tools 的总 token > 10% context 时才启用
+    #
+    # 故意放在最后一步:前面 sanitize 已经规范化了 schema,组装 idempotent
+    # (调两次结果一样)。
     # ── Tool Search (progressive disclosure) ────────────────────────────
     # Conditionally replace MCP + plugin (non-core) tools with three bridge
     # tools (tool_search / tool_describe / tool_call) when the deferrable
@@ -528,6 +741,18 @@ def _resolve_active_context_length() -> int:
 
     Returns 0 when the model can't be resolved — ``should_activate`` falls
     back to a fixed token cutoff in that case.
+
+    # === 作用:算出"当前模型 context 窗口有多大" ===
+    # 用来给 Tool Search 决策:
+    #   deferrable tools 的总 token > 10% context  → 激活 tool search
+    #
+    # 流程:
+    #   1. 从 config.yaml 拿 model.model 字段(或 model.default 兜底)
+    #   2. 用 model_id 查 model_metadata 表
+    #   3. 拿不到 → 返回 0(让 tool_search 走固定 token 兜底)
+    #
+    # 异常全 catch,debug 级别 log:
+    #   任何一步炸了都不影响主流程(没有 context length 就用兜底)
     """
     try:
         from hermes_cli.config import load_config as _load
@@ -561,25 +786,34 @@ _READ_SEARCH_TOOLS = {"read_file", "search_files"}
 # Tool error sanitization
 # =========================================================================
 #
-# Tool exceptions can carry arbitrary text into the model's context as the
-# `tool` message content. json.dumps() handles quote/backslash escaping so a
-# raw injection of `</tool_call>` won't break message framing, but the model
-# still *reads* those tokens and they can confuse downstream tool-call
-# parsing or, in adversarial cases, nudge it toward role-confusion framing.
+# === 为什么需要? ===
+# 工具抛异常时,异常消息(str(e) 可能含任何东西:用户输入、文件内容、
+# 网络响应)会作为 `tool` 消息的 content 灌进 model context。
 #
-# This helper strips structural framing tokens (XML role tags, CDATA,
-# markdown code fences) and caps the message at a sane upper bound before it
-# becomes part of the conversation. It's defense-in-depth — the json layer
-# already prevents framing escape — but cheap and worth having.
+# 风险 1:json.dumps 已经做了 quote/backslash 转义,所以原始
+#         `</tool_call>` 这种 token 不会破坏 message 框架(框架层安全)。
+# 风险 2:但 model 会"读"这些 token——它可能误以为"这是结构化标记",
+#         在解析时出错,或者被 adversarial 攻击诱导到 role-confusion
+#         (假装自己是 user/system 角色)。
 #
+# 防御:把 XML role tag、markdown fence、CDATA 这种"结构化 token"
+#      全 strip 掉,并加 [TOOL_ERROR] 前缀让 model 知道这是错误段。
+# 是 defense-in-depth,便宜划算。
 # Ported from ironclaw#1639.
+
+# 4 类需要清洗的 framing token:
+# 1. role tag: <tool_call> / </function_call> / <system> ...
 _TOOL_ERROR_ROLE_TAG_RE = re.compile(
     r'</?(?:tool_call|function_call|result|response|output|input|system|assistant|user)>',
     re.IGNORECASE,
 )
+# 2. 开头的代码 fence: ```json / ```xml / ```html / ```markdown / ```
 _TOOL_ERROR_FENCE_OPEN_RE = re.compile(r'^\s*```(?:json|xml|html|markdown)?\s*', re.MULTILINE)
+# 3. 结尾的代码 fence
 _TOOL_ERROR_FENCE_CLOSE_RE = re.compile(r'\s*```\s*$', re.MULTILINE)
+# 4. CDATA 块(可能含隐藏的 XML/HTML 注入)
 _TOOL_ERROR_CDATA_RE = re.compile(r'<!\[CDATA\[.*?\]\]>', re.DOTALL)
+# 长度上限 2000——避免 1 个错误吃掉大量 context
 _TOOL_ERROR_MAX_LEN = 2000
 
 
@@ -587,6 +821,17 @@ def _sanitize_tool_error(error_msg: str) -> str:
     """Strip structural framing tokens from a tool error before showing it to the model.
 
     See _TOOL_ERROR_ROLE_TAG_RE docstring above for rationale.
+
+    # === 清洗流程(5 步) ===
+    # 1. 空字符串 → 直接返 "[TOOL_ERROR] "(占位)
+    # 2. strip role tag
+    # 3. strip 开 / 闭 fence
+    # 4. strip CDATA
+    # 5. 超过 2000 字符 → 截断 + "..."
+    # 6. 加 [TOOL_ERROR] 前缀
+    #
+    # 注:前缀 [TOOL_ERROR] 是给 model 的"语义标签",
+    # 告诉它"下面这段是工具报错,不是用户输入或你的输出"
     """
     if not error_msg:
         return "[TOOL_ERROR] "
@@ -602,6 +847,19 @@ def _sanitize_tool_error(error_msg: str) -> str:
 # =========================================================================
 # Tool argument type coercion
 # =========================================================================
+#
+# === 为什么需要 coerce? ===
+# 现实:LLM 经常传错类型
+#   - 数字当字符串:  "42" 而不是 42
+#   - 布尔当字符串: "true" 而不是 true
+#   - 数组当裸标量: {"urls": "https://a.com"} 但 schema 要求 array
+#     这种情况在 DeepSeek / Qwen / GLM 这些 open-weight 模型上特别常见
+#
+# 这一段:对照工具的 JSON Schema,安全地把字符串纠正成 schema 期望的类型。
+# 纠正失败 → 保留原值(不抛异常,让 tool handler 自己判断)
+#
+# 涉及:coerce_tool_args / _coerce_value / _schema_allows_null /
+#      _coerce_json / _coerce_number / _coerce_boolean
 
 def coerce_tool_args(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     """Coerce tool call arguments to match their JSON Schema types.
@@ -620,6 +878,17 @@ def coerce_tool_args(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     sometimes emit ``{"urls": "https://a.com"}`` when the tool expects
     ``{"urls": ["https://a.com"]}``; wrapping here avoids a confusing tool
     failure on what is otherwise a well-formed call.
+
+    # === 流程(对 args 的每个 key) ===
+    # 1. 从 schema.parameters.properties 拿这个 key 的 prop_schema
+    # 2. 如果 schema 期望 array,值不是 list/tuple/None → 包成单元素 list
+    # 3. 如果 schema 期望 integer/number/boolean,值是字符串 → _coerce_value
+    # 4. 纠正成功(返回值不等于原值)→ 替换
+    # 5. 纠正失败(返回原值)→ 保留不动
+    #
+    # === 为什么不"不纠正就抛异常"? ===
+    # 工具 handler 可能有兜底逻辑(比如 read_file 的 normalize_read_pagination),
+    # 传错类型让 handler 自己处理,比直接 400 报错更友好。
     """
     if not args or not isinstance(args, dict):
         return args
@@ -638,6 +907,15 @@ def coerce_tool_args(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
             continue
         expected = prop_schema.get("type")
 
+        # ════════════════════════════════════════════════════════════════
+        # 子分支 A:schema 期望 array,值不是 list → 包成单元素 list
+        # ════════════════════════════════════════════════════════════════
+        # 字符串值先过 _coerce_value:
+        #   - "[\"a\", \"b\"]" 这种 JSON 编码的数组会被 json.loads 解析
+        #   - "null" 在 nullable schema 下会被转成 None
+        # 否则单字符串就包成 ["字符串"]。
+        #
+        # None 自身保留(模型可能想"省略"或"空列表",工具 handler 有默认值兜底)
         # Wrap bare non-list values when the schema declares ``array``.
         # Strings still go through _coerce_value first so JSON-encoded
         # arrays (``'["a","b"]'``) get parsed and nullable ``"null"``
@@ -676,6 +954,11 @@ def coerce_tool_args(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
             )
             continue
 
+        # ════════════════════════════════════════════════════════════════
+        # 子分支 B:非 array 的标量类型纠正
+        # ════════════════════════════════════════════════════════════════
+        # 只对字符串值纠正(数字 / 布尔已经是正确类型就跳过)
+        # 没有 expected_type 且 schema 不是 nullable → 跳过(不知道往哪转)
         if not isinstance(value, str):
             continue
         if not expected and not _schema_allows_null(prop_schema):
@@ -691,6 +974,15 @@ def _coerce_value(value: str, expected_type, schema: dict | None = None):
     """Attempt to coerce a string *value* to *expected_type*.
 
     Returns the original string when coercion is not applicable or fails.
+
+    # === 路由表(按 expected_type 分发) ===
+    # "null"             → "null" 字符串 → None(nullable 才生效)
+    # "integer"/"number" → _coerce_number(后者允许小数)
+    # "boolean"          → _coerce_boolean("true"/"false")
+    # "array"            → _coerce_json(str, list)  [JSON 解析]
+    # "object"           → _coerce_json(str, dict)  [JSON 解析]
+    # list(union)        → 逐个尝试,第一个成功的类型
+    # 其他/失败          → 返回原值
     """
     if _schema_allows_null(schema) and value.strip().lower() == "null":
         return None
@@ -717,7 +1009,15 @@ def _coerce_value(value: str, expected_type, schema: dict | None = None):
 
 
 def _schema_allows_null(schema: dict | None) -> bool:
-    """Return True when a JSON Schema fragment explicitly permits null."""
+    """Return True when a JSON Schema fragment explicitly permits null.
+
+    # === JSON Schema 表达"可空"有 4 种写法 ===
+    # 1. type: "null"(单独 null 类型)
+    # 2. type: ["string", "null"] (联合类型,显式列 null)
+    # 3. nullable: true (OpenAPI 风格,不是标准 JSON Schema)
+    # 4. anyOf/oneOf 包含 {"type": "null"} (标准联合类型)
+    # 4 种全部要识别,缺一个就漏判。
+    """
     if not isinstance(schema, dict):
         return False
 
@@ -747,6 +1047,14 @@ def _coerce_json(value: str, expected_python_type: type):
     causes the LLM to emit the array/object as a JSON string instead of a native
     structure.  Returns the original string if parsing fails or yields the wrong
     Python type.
+
+    # === 什么场景会触发 ===
+    # 复杂 schema(oneOf / discriminated union)经常让 LLM "偷懒"——把
+    # 整个 array/object 当字符串输出("["a", "b"]")而不是原生结构。
+    # 这种情况 _coerce_value 分流到 _coerce_json 处理:
+    #   1. json.loads 尝试解析
+    #   2. 解析成功 + 类型对 → 返解析后的对象
+    #   3. 解析失败 或 类型不对 → 返原值(handler 看到字符串再处理)
     """
     try:
         parsed = json.loads(value)
@@ -772,7 +1080,17 @@ def _coerce_json(value: str, expected_python_type: type):
 
 
 def _coerce_number(value: str, integer_only: bool = False):
-    """Try to parse *value* as a number.  Returns original string on failure."""
+    """Try to parse *value* as a number.  Returns original string on failure.
+
+    # === 三道防御 ===
+    # 1. float() 解析失败(非数字字符串)→ 返原值
+    # 2. inf / -inf / NaN 不可 JSON 序列化 → 返原值(NaN 的 f != f 是个老 trick)
+    # 3. integer_only=True 但有小数部分("3.14")→ 返原值
+    #    (削掉小数会"无声地"改变语义,不如让 handler 自己处理)
+    #
+    # === 整数优先 ===
+    # "42.0" 也返 42(int),因为 f == int(f) 判定为整数无小数
+    """
     try:
         f = float(value)
     except (ValueError, OverflowError):
@@ -790,7 +1108,12 @@ def _coerce_number(value: str, integer_only: bool = False):
 
 
 def _coerce_boolean(value: str):
-    """Try to parse *value* as a boolean.  Returns original string on failure."""
+    """Try to parse *value* as a boolean.  Returns original string on failure.
+
+    # 严格只认 "true" / "false"(case-insensitive、strip 空白)
+    # "yes" / "1" / "on" 不算——不引入模糊语义。
+    # 失败就返原字符串(handler 可能另有判断逻辑)
+    """
     low = value.strip().lower()
     if low == "true":
         return True
@@ -814,6 +1137,26 @@ def handle_function_call(
     """
     Main function call dispatcher that routes calls to the tool registry.
 
+    # === 整个 agent 调工具的"主入口" ===
+    # 主循环(run_agent.py)拿到模型返回的 tool_call 就调这个函数。
+    # 它要做 5 件事:
+    #   1. 参数类型纠正("42" → 42)
+    #   2. Tool Search bridge 处理(tool_search / tool_describe / tool_call)
+    #   3. Agent-loop 工具拦截(todo / memory / session_search / delegate_task)
+    #   4. pre/post hook(确认/审计)
+    #   5. read_file 入口走 read_file_tool(read_file / search_files 合并)
+    #   6. registry.dispatch()(实际执行 handler)
+    #
+    # === 11 个参数 ===
+    # function_name / function_args   模型说的工具名 + 参数
+    # task_id                         terminal/browser session 隔离 ID
+    # tool_call_id                    OpenAI tool_call.id(用于 trace / 取消)
+    # session_id                      agent session(让工具看 session 状态)
+    # user_task                       原始用户任务(给 browser_snapshot 用上下文)
+    # enabled_tools                   当前 session 启用的工具名(给 execute_code)
+    # skip_pre_tool_call_hook         True 跳过 pre-hook(给内部桥接用)
+    # enabled_toolsets / disabled_toolsets  给 Tool Search bridge 限定可见工具
+
     Args:
         function_name: Name of the function to call.
         function_args: Arguments for the function.
@@ -835,9 +1178,23 @@ def handle_function_call(
     Returns:
         Function result as a JSON string.
     """
+    # ════════════════════════════════════════════════════════════════
+    # Step 1: 参数类型纠正
+    # ════════════════════════════════════════════════════════════════
+    # "42" → 42, "true" → True, ["42"] → [42] 等
+    # 纠正失败保留原值(handler 兜底)
     # Coerce string arguments to their schema-declared types (e.g. "42"→42)
     function_args = coerce_tool_args(function_name, function_args)
 
+    # ════════════════════════════════════════════════════════════════
+    # Step 2: Tool Search bridge 调度
+    # ════════════════════════════════════════════════════════════════
+    # 背景:_compute_tool_definitions 在工具太多时,把周边工具"折叠"成
+    #       3 个桥接工具(tool_search / tool_describe / tool_call)。
+    # 调度策略:
+    #   tool_search  → 直接读 catalog(纯查,inline 处理)
+    #   tool_describe → 直接读 catalog(纯查,inline 处理)
+    #   tool_call    → 拆包到底层工具,递归 dispatch(让 hook 看到真名)
     # ── Tool Search bridge dispatch ──────────────────────────────────
     # tool_search and tool_describe are pure catalog reads — handle them
     # inline. tool_call is unwrapped to the underlying tool so that every
@@ -872,12 +1229,16 @@ def handle_function_call(
         except Exception:
             current_defs = []
         if function_name == _ts_mod.TOOL_SEARCH_NAME:
+            # 纯查:模型想找"web_*"开头的工具 → 返匹配列表
             return _ts_mod.dispatch_tool_search(function_args or {},
                                                 current_tool_defs=current_defs)
         if function_name == _ts_mod.TOOL_DESCRIBE_NAME:
+            # 纯查:模型想看某个工具的完整 schema
             return _ts_mod.dispatch_tool_describe(function_args or {},
                                                   current_tool_defs=current_defs)
         if function_name == _ts_mod.TOOL_CALL_NAME:
+            # 拆包:把 tool_call 还原成"真工具名 + 真参数",递归 dispatch
+            # 好处:所有 hook(pre/post、确认、guardrail)都看到真名
             underlying_name, underlying_args, err = _ts_mod.resolve_underlying_call(function_args or {})
             if err or not underlying_name:
                 return json.dumps({"error": err or "tool_call could not be resolved"},
@@ -912,12 +1273,28 @@ def handle_function_call(
             )
 
     try:
+        # ════════════════════════════════════════════════════════════════
+        # Step 3: Agent-loop 工具拦截
+        # ════════════════════════════════════════════════════════════════
+        # 一些工具(todo / memory / session_search / delegate_task)需要
+        # agent 级别的状态(TodoStore / MemoryStore),registry 里只放了
+        # schema,handler 是个空壳。run_agent.py 会在主循环里拦截它们自己
+        # 处理。如果这里意外走到 → 返错误让模型重试或换工具。
         if function_name in _AGENT_LOOP_TOOLS:
             return json.dumps({"error": f"{function_name} must be handled by the agent loop"})
 
-        # Check plugin hooks for a block directive (unless caller already
-        # checked — e.g. run_agent._invoke_tool passes skip=True to
-        # avoid double-firing the hook).
+        # ════════════════════════════════════════════════════════════════
+        # Step 4: pre-tool-call hook(确认/审计)
+        # ════════════════════════════════════════════════════════════════
+        # plugin 在执行前可以检查这次调用:
+        #   - 安全检查(黑名单命令、敏感文件路径)
+        #   - 用户确认(危险操作)
+        #   - 审计日志
+        # get_pre_tool_call_block_message() 返回 None 表示放行,
+        # 返回 str 表示拦截,把 str 当错误消息返给模型。
+        #
+        # skip_pre_tool_call_hook=True 时跳过(避免重复触发,run_agent
+        # 自己已经检查过)
         #
         # Single-fire contract: pre_tool_call fires exactly once per tool
         # execution. get_pre_tool_call_block_message() internally calls
@@ -942,6 +1319,13 @@ def handle_function_call(
             if block_message is not None:
                 return json.dumps({"error": block_message}, ensure_ascii=False)
 
+        # ════════════════════════════════════════════════════════════════
+        # Step 5: ACP / Zed 编辑审批(write_file / patch 之前)
+        # ════════════════════════════════════════════════════════════════
+        # 在 ACP session 里(用 Zed IDE 接进来),写文件需要用户确认。
+        # CLI / gateway 路径 ContextVar 没绑,直接跳过。
+        # 如果审批 guard 自身炸了,且这次调的是写工具 → 兜底拒绝
+        # (fail-closed:宁可多拦截,不要放行未知状态)
         # ACP/Zed edit approval runs before any file mutation.  The requester
         # is bound via ContextVar only for ACP sessions, so CLI/gateway paths
         # are unaffected when it is unset.
@@ -956,6 +1340,12 @@ def handle_function_call(
             if function_name in {"write_file", "patch"}:
                 return json.dumps({"error": "Edit approval denied: approval guard failed"}, ensure_ascii=False)
 
+        # ════════════════════════════════════════════════════════════════
+        # Step 6a: 读循环检测(non-read 工具重置连续 read 计数)
+        # ════════════════════════════════════════════════════════════════
+        # 模型陷入"连读 N 次文件"时,read_file_tool 内部会强制打断,
+        # 提示模型换策略。notify_other_tool_call 就是告诉 tracker:
+        # "这次不是 read,清零连续计数"。
         # Notify the read-loop tracker when a non-read/search tool runs,
         # so the *consecutive* counter resets (reads after other work are fine).
         if function_name not in _READ_SEARCH_TOOLS:
@@ -965,6 +1355,15 @@ def handle_function_call(
             except Exception:
                 pass  # file_tools may not be loaded yet
 
+        # ════════════════════════════════════════════════════════════════
+        # Step 6b: 实际派发(registry.dispatch)
+        # ════════════════════════════════════════════════════════════════
+        # 走到这里说明前面所有 guard 都放行。
+        # 计时:用 monotonic()(墙钟跳变不影响),给 post-hook 一个 duration_ms。
+        # 模仿 Claude Code 2.1.119 的 PostToolUse hook 输入。
+        #
+        # 特殊:execute_code 多传 enabled_tools(沙箱内能调的工具列表),
+        #       防止 subagent 偷换 process-global _last_resolved_tool_names。
         # Measure tool dispatch latency so post_tool_call and
         # transform_tool_result hooks can observe per-tool duration.
         # Inspired by Claude Code 2.1.119, which added ``duration_ms`` to
@@ -990,6 +1389,17 @@ def handle_function_call(
             )
         duration_ms = int((time.monotonic() - _dispatch_start) * 1000)
 
+        # ════════════════════════════════════════════════════════════════
+        # Step 7: post-tool-call hook(观察)+ transform_tool_result(改写)
+        # ════════════════════════════════════════════════════════════════
+        # post_tool_call  是观察型 hook,通知 plugin"工具跑完了"
+        #   (plugin 自己用,不影响返回值)
+        # transform_tool_result  是改写型 hook:
+        #   - 多个 plugin 都跑,第一个返 str 的覆盖 result
+        #   - 返 None / 非 str 忽略
+        #   - fail-open:hook 炸了不传播
+        # 顺序:先 post_tool_call(看),再 transform(改写)——保证 transform
+        #       拿到的是真实结果
         try:
             from hermes_cli.plugins import invoke_hook
             invoke_hook(
@@ -1033,6 +1443,12 @@ def handle_function_call(
         return result
 
     except Exception as e:
+        # ════════════════════════════════════════════════════════════════
+        # 异常兜底:任何一步炸了都不能污染主循环
+        # ════════════════════════════════════════════════════════════════
+        # logger.exception 记 traceback
+        # 走 _sanitize_tool_error 把 framing token 洗掉
+        # 返 JSON 错误给模型(它会决定重试 or 换工具)
         error_msg = f"Error executing {function_name}: {str(e)}"
         logger.exception(error_msg)
         return json.dumps({"error": _sanitize_tool_error(error_msg)}, ensure_ascii=False)
@@ -1041,6 +1457,11 @@ def handle_function_call(
 # =============================================================================
 # Backward-compat wrapper functions
 # =============================================================================
+#
+# === 5 个 thin wrapper ===
+# 这些函数存在的唯一原因:老代码(plugins、外部脚本、CLI 子命令)
+# 直接 import `model_tools.xxx`,而不是 `model_tools.registry.xxx`。
+# 现在保留这些 1-行 wrapper,既不破坏老 API,又统一了"对外门面"。
 
 def get_all_tool_names() -> List[str]:
     """Return all registered tool names."""

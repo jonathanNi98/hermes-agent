@@ -173,20 +173,25 @@ def scan_bundles() -> Dict[str, Dict[str, Any]]:
     a warning (first wins, alphabetical order).
     """
     global _bundles_cache, _bundles_cache_mtime
+    # 1) 列出 bundles 目录下所有 *.yaml / *.yml（按字母序）
     files = _iter_bundle_files()
     out: Dict[str, Dict[str, Any]] = {}
     for f in files:
+        # 2) 单个文件解析失败 → 跳过，不影响别的 bundle 加载
         info = _load_bundle_file(f)
         if not info:
             continue
+        # 3) key 一律以 "/" 开头，和 skill 路由保持一致
         key = f"/{info['slug']}"
         if key in out:
+            # 4) 同名 slug：第一个胜出（字母序在前的赢），后者打 WARNING 跳过
             logger.warning(
                 "Duplicate bundle slug %s from %s; keeping %s",
                 key, f, out[key]["path"],
             )
             continue
         out[key] = info
+    # 5) 全量替换缓存 + 记录当前 mtime，下游 get_skill_bundles() 据此判断是否要重扫
     _bundles_cache = out
     _bundles_cache_mtime = _max_mtime(files)
     return out
@@ -198,8 +203,13 @@ def get_skill_bundles() -> Dict[str, Dict[str, Any]]:
     Cheap to call repeatedly: only rescans when the bundles directory or
     any bundle file's mtime is newer than the cached snapshot.
     """
+    # 1) 重新算一遍当前磁盘状态（目录 + 所有 yaml 文件的 mtime）
     files = _iter_bundle_files()
     current_mtime = _max_mtime(files)
+    # 2) 两种情况触发重扫：
+    #    a) 缓存为空（首次调用 / 被外部清掉）
+    #    b) 磁盘 mtime 和缓存里记录的不一致（有人新增/修改/删除了 bundle）
+    # 否则直接返回缓存 —— 这就是"廉价热重载"的全部秘密
     if not _bundles_cache or _bundles_cache_mtime != current_mtime:
         scan_bundles()
     return _bundles_cache
@@ -265,6 +275,7 @@ def build_bundle_invocation_message(
     the same forgiving stance ``build_preloaded_skills_prompt`` uses for
     ``-s`` CLI preloading.
     """
+    # 0) 入口检查：bundle 找不到直接返回 None
     bundles = get_skill_bundles()
     info = bundles.get(cmd_key)
     if not info:
@@ -272,8 +283,10 @@ def build_bundle_invocation_message(
 
     # Late import to avoid pulling tools/* at module import time and to
     # keep skill_bundles cheap to import in test environments.
+    # 1) 延迟导入：避免模块加载时把 tools/* 一起拖进来，单元测试场景更友好
     from agent.skill_commands import _load_skill_payload, _build_skill_message
 
+    # 2) 四个累加器：成功列表 / 失败列表 / 拼好的 skill 块 / 去重 set
     loaded_names: List[str] = []
     missing: List[str] = []
     skill_blocks: List[str] = []
@@ -283,24 +296,31 @@ def build_bundle_invocation_message(
     skills = info["skills"]
     extra_instruction = info.get("instruction") or ""
 
+    # 3) 遍历 bundle 配置的 skill 列表，逐个加载
     for skill_id in skills:
         identifier = (skill_id or "").strip()
+        # 3a) 空字符串 / 重复项跳过 —— 去重由 `seen` set 保证
         if not identifier or identifier in seen:
             continue
         seen.add(identifier)
 
+        # 3b) 真的去磁盘上 load（这个函数在 skill_commands.py 里实现）
         loaded = _load_skill_payload(identifier, task_id=task_id)
         if not loaded:
+            # 3c) 加载失败（skill 不存在 / 文件损坏）→ 记入 missing，不抛异常
             missing.append(identifier)
             continue
         loaded_skill, skill_dir, skill_name = loaded
 
+        # 3d) 使用埋点：bump_use() 记录 skill 被使用，best-effort，失败不阻断
         try:
             from tools.skill_usage import bump_use
             bump_use(skill_name)
         except Exception:
             pass
 
+        # 3e) 拼单条 skill 的 message 块，带上 "我是 bundle 一部分" 的标记
+        #     这个 activation_note 会出现在每个 skill 的 prompt 头部
         activation_note = (
             f'[Loaded as part of the "{bundle_name}" skill bundle.]'
         )
@@ -314,11 +334,16 @@ def build_bundle_invocation_message(
         )
         loaded_names.append(skill_name)
 
+    # 4) 一个 skill 都没加载成功 → 返回 None，让上层走"未找到"分支
     if not skill_blocks:
         return None
 
     # Header — tells the agent this is a bundle, lists the skills, and
     # provides any author-supplied instruction.
+    # 5) 拼 header —— 告诉 agent 三件事：
+    #    a) 这是 bundle，不是单个 skill（强调 + 列出加载/缺失的 skill 名）
+    #    b) bundle 作者额外写的 instruction（可选）
+    #    c) 用户这一次附带的具体 instruction（可选）
     header_lines = [
         f'[IMPORTANT: The user has invoked the "{bundle_name}" skill bundle, '
         f"loading {len(loaded_names)} skills together. Treat every skill below "
@@ -337,6 +362,8 @@ def build_bundle_invocation_message(
         )
 
     header = "\n".join(header_lines)
+    # 6) 最终产物：header + 所有 skill 块，用 \n\n 隔开
+    #    返回三元组供调用方分别做日志/展示
     return ("\n\n".join([header, *skill_blocks]), loaded_names, missing)
 
 

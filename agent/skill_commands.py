@@ -260,6 +260,20 @@ def _build_skill_message(
     return "\n".join(parts)
 
 
+# ────────────────────────────────────────────────────────────
+# 1.1 scan_skill_commands — 把所有 skill 注册成 /skill-name 命令
+# ────────────────────────────────────────────────────────────
+#
+# 角色:Skills 系统的"书店进货"。
+#      扫所有目录的 SKILL.md,把每个 skill 注册成 /<slug> 形式的命令。
+#      返 {"/slug": {name, description, skill_md_path, skill_dir}, ...}
+#
+# 调用方:get_skill_commands()(被 2.x 调用),reload_skills()
+#
+# 设计:
+#   1. 全量替换 _skill_commands 缓存(简单可靠)
+#   2. 记录当前 platform 上下文(给 get_skill_commands 判断要不要重扫)
+#   3. 局部异常吞掉(单 skill 失败不阻断整体)
 def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
     """Scan ~/.hermes/skills/ and return a mapping of /command -> skill info.
 
@@ -267,7 +281,9 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
         Dict mapping "/skill-name" to {name, description, skill_md_path, skill_dir}.
     """
     global _skill_commands, _skill_commands_platform
+    # 1.2 记下当前 platform scope(后续 get_skill_commands 据此判断要不要重扫)
     _skill_commands_platform = _resolve_skill_commands_platform()
+    # 1.3 全量替换缓存(简单可靠,避免陈旧条目残留)
     _skill_commands = {}
     try:
         from tools.skills_tool import SKILLS_DIR, _parse_frontmatter, skill_matches_platform, _get_disabled_skill_names
@@ -275,7 +291,7 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
         disabled = _get_disabled_skill_names()
         seen_names: set = set()
 
-        # Scan local dir first, then external dirs
+        # 1.4 决定扫哪些目录(本地优先,再外部)
         dirs_to_scan = []
         if SKILLS_DIR.exists():
             dirs_to_scan.append(SKILLS_DIR)
@@ -283,21 +299,24 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
 
         for scan_dir in dirs_to_scan:
             for skill_md in iter_skill_index_files(scan_dir, "SKILL.md"):
+                # 1.5 排除 VCS / hub / archive 目录
                 if any(part in {'.git', '.github', '.hub', '.archive'} for part in skill_md.parts):
                     continue
                 try:
                     content = skill_md.read_text(encoding='utf-8')
                     frontmatter, body = _parse_frontmatter(content)
-                    # Skip skills incompatible with the current OS platform
+                    # 1.6 平台过滤(macOS-only skill 在 Windows 上不注册)
                     if not skill_matches_platform(frontmatter):
                         continue
                     name = frontmatter.get('name', skill_md.parent.name)
+                    # 1.7 去重(同名 skill 在多个目录 → 取第一个)
                     if name in seen_names:
                         continue
-                    # Respect user's disabled skills config
+                    # 1.8 disabled 过滤(用户禁用 → 不注册)
                     if name in disabled:
                         continue
                     description = frontmatter.get('description', '')
+                    # 1.9 description 兜底:取 body 第一段非标题文字(截断 80)
                     if not description:
                         for line in body.strip().split('\n'):
                             line = line.strip()
@@ -305,12 +324,13 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                                 description = line[:80]
                                 break
                     seen_names.add(name)
-                    # Normalize to hyphen-separated slug, stripping
-                    # non-alnum chars (e.g. +, /) to avoid invalid
-                    # Telegram command names downstream.
+                    # 1.10 slug 规范化:小写 + 空格/下划线转连字符
+                    # 重要:Telegram bot command 禁止连字符
+                    # 所以 "claude-code" 在 Telegram 走 "claude_code"
+                    # 这一步保证本地注册的就是 /claude-code
                     cmd_name = name.lower().replace(' ', '-').replace('_', '-')
-                    cmd_name = _SKILL_INVALID_CHARS.sub('', cmd_name)
-                    cmd_name = _SKILL_MULTI_HYPHEN.sub('-', cmd_name).strip('-')
+                    cmd_name = _SKILL_INVALID_CHARS.sub('', cmd_name)  # 去非法字符(+,/)
+                    cmd_name = _SKILL_MULTI_HYPHEN.sub('-', cmd_name).strip('-')  # 多连字符合并
                     if not cmd_name:
                         continue
                     _skill_commands[f"/{cmd_name}"] = {
@@ -326,6 +346,20 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
     return _skill_commands
 
 
+# ────────────────────────────────────────────────────────────
+# 2.1 get_skill_commands — 缓存层(智能判断要不要重扫)
+# ────────────────────────────────────────────────────────────
+#
+# 角色:Skills 系统的"书店前台"。
+#      客人来问书,先看库存(缓存)有没有,没有或过期就重扫。
+#
+# 与 skill_bundles.get_skill_bundles() 的对比:
+#   - bundle 走 mtime 变更检测
+#   - command 走 platform 变更检测(gateway 同时服务多平台场景,#14536)
+#
+# 重扫触发条件(任一):
+#   1. 缓存为空(首次调用 / 外部清掉)
+#   2. platform scope 变了(gateway 切到另一个 platform)
 def get_skill_commands() -> Dict[str, Dict[str, Any]]:
     """Return the current skill commands mapping (scan first if empty).
 
@@ -406,6 +440,22 @@ def reload_skills() -> Dict[str, Any]:
     }
 
 
+# ────────────────────────────────────────────────────────────
+# 3.1 resolve_skill_command_key — 用户输入 → 规范 /slug
+# ────────────────────────────────────────────────────────────
+#
+# 角色:Skills 系统的"路由"。
+#      用户输入可能是:
+#        - "/claude-code"
+#        - "/claude_code"(Telegram 自动转下划线)
+#        - "claude-code"(没斜杠)
+#        - "claude_code"
+#      全部归一化到 "/claude-code" 然后查表。
+#
+# 设计:连字符 + 下划线 等价
+#   scan_skill_commands 总是用连字符存(/claude-code)
+#   但 Telegram 强制下划线(/claude_code)
+#   所以路由时把下划线都转连字符,再查表
 def resolve_skill_command_key(command: str) -> Optional[str]:
     """Resolve a user-typed /command to its canonical skill_cmds key.
 
@@ -421,10 +471,25 @@ def resolve_skill_command_key(command: str) -> Optional[str]:
     """
     if not command:
         return None
+    # 3.2 下划线 → 连字符(归一化),拼 / 前缀,查表
     cmd_key = f"/{command.replace('_', '-')}"
     return cmd_key if cmd_key in get_skill_commands() else None
 
 
+# ────────────────────────────────────────────────────────────
+# 4.1 build_skill_invocation_message — 把 /<skill> 拼成 user message
+# ────────────────────────────────────────────────────────────
+#
+# 角色:Skills 系统的"包装"。
+#      用户打 /github-code-review(或带参数:/foo 帮我做 X)
+#      这里把 skill 内容 + 用户参数 拼成一个 user message,送进 conversation_loop
+#
+# 调用链:
+#   用户输入 /<slug> [用户参数]
+#     → skill_commands.py:parse_skill_invocation 解析
+#     → resolve_skill_command_key 解析 key
+#     → build_skill_invocation_message(这里)拼 message
+#     → conversation_loop 把它当 user message
 def build_skill_invocation_message(
     cmd_key: str,
     user_instruction: str = "",
@@ -440,28 +505,34 @@ def build_skill_invocation_message(
     Returns:
         The formatted message string, or None if the skill wasn't found.
     """
+    # 4.2 查表拿到 skill 信息
     commands = get_skill_commands()
     skill_info = commands.get(cmd_key)
     if not skill_info:
         return None
 
+    # 4.3 真正从磁盘加载 skill(走 skill_view 那条路径)
     loaded = _load_skill_payload(skill_info["skill_dir"], task_id=task_id)
     if not loaded:
         return None
 
     loaded_skill, skill_dir, skill_name = loaded
 
-    # Track active usage for Curator lifecycle management (#17782)
+    # 4.4 埋点:记录 skill 被使用(#17782 Curator 生命周期管理)
+    # best-effort,失败不阻断
     try:
         from tools.skill_usage import bump_use
         bump_use(skill_name)
     except Exception:
         pass  # Non-critical — skill invocation proceeds regardless
 
+    # 4.5 activation_note — 显式告诉 LLM "用户调了这个 skill,按它说的做"
+    # 提示词前置,影响 LLM 行为(让 LLM 把 skill 内容当指令而非数据)
     activation_note = (
         f'[IMPORTANT: The user has invoked the "{skill_name}" skill, indicating they want '
         "you to follow its instructions. The full skill content is loaded below.]"
     )
+    # 4.6 调 _build_skill_message 拼最终内容(activation_note + skill body + 用户指令)
     return _build_skill_message(
         loaded_skill,
         skill_dir,

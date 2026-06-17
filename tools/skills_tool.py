@@ -629,6 +629,20 @@ def _sort_skills(skills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(skills, key=lambda s: (s.get("category") or "", s["name"]))
 
 
+# ────────────────────────────────────────────────────────────
+# 1.1 skills_list — Tier 1 入口(只返 name + description)
+# ────────────────────────────────────────────────────────────
+#
+# 角色:Skills 系统的"目录页"。
+#      LLM 调它一次性看到所有可用 skill 的名字和简介。
+#      **不**返完整正文 — 那是 skill_view() 的活。
+#
+# 设计:Progressive Disclosure Tier 1
+#      一次列 50 个 skill,只返 (name, description, category),
+#      每个 ~30-50 tokens。完整内容按需调 skill_view。
+#      避免一次塞 50 个 SKILL.md 把 context 撑爆。
+#
+# 返回:JSON 字符串(不是 dict) — 走 LLM tool_result 的标准格式
 def skills_list(category: str = None, task_id: str = None) -> str:
     """
     List all available skills (progressive disclosure tier 1 - minimal metadata).
@@ -644,6 +658,9 @@ def skills_list(category: str = None, task_id: str = None) -> str:
         JSON string with minimal skill info: name, description, category
     """
     try:
+        # 1.2 目录存在性检查 + 首次创建
+        # 用户可能刚装 hermes 还没建 ~/.hermes/skills/
+        # 这里顺手建好(不报错),返一个空 list + 友好提示
         if not SKILLS_DIR.exists():
             SKILLS_DIR.mkdir(parents=True, exist_ok=True)
             return json.dumps(
@@ -656,9 +673,20 @@ def skills_list(category: str = None, task_id: str = None) -> str:
                 ensure_ascii=False,
             )
 
-        # Find all skills
+        # 1.3 扫所有 skill(本地 + 外部 + 插件)
+        # _find_all_skills() 内部做:
+        #   1. 递归 os.walk SKILLS_DIR 和 external_dirs
+        #   2. parse_frontmatter 取 name/description
+        #   3. 平台过滤(current_platform 不在 platforms 里 → 跳过)
+        #   4. disabled 过滤
+        #   5. 去重(seen_names)
+        #   6. 异常吞掉(一个坏 skill 不能让整个 list 失败)
+        # 注意:每个 skill **只读前 4000 字符**(frontmatter 足够)
         all_skills = _find_all_skills()
 
+        # 1.4 空集友好处理
+        # 目录存在但里面啥也没有(用户没装任何 skill)
+        # 不报错,返空 + 提示
         if not all_skills:
             return json.dumps(
                 {
@@ -670,18 +698,28 @@ def skills_list(category: str = None, task_id: str = None) -> str:
                 ensure_ascii=False,
             )
 
-        # Filter by category if specified
+        # 1.5 可选 category 过滤
+        # LLM 可能传 "github" 想只看 GitHub 相关 skill
+        # 不传 → 返所有
         if category:
             all_skills = [s for s in all_skills if s.get("category") == category]
 
-        # Sort by category then name
+        # 1.6 稳定排序
+        # 按 (category, name) 排,保证两次调用的顺序一致
+        # 重要:LLM 多次调 skills_list 看到的顺序不能变
         all_skills = _sort_skills(all_skills)
 
-        # Extract unique categories
+        # 1.7 提取所有 category(去重 + 排序)
+        # 给 LLM 一个"所有分类"的概览
+        # 用 set 去重,再 sorted 排序
+        # 过滤掉 None(category 为空的 skill 不进分类列表)
         categories = sorted(
             {s.get("category") for s in all_skills if s.get("category")}
         )
 
+        # 1.8 返最终结果
+        # hint 字段告诉 LLM:想看完整内容请调 skill_view()
+        # 引导 LLM 进入 Tier 2(progressive disclosure 的下一步)
         return json.dumps(
             {
                 "success": True,
@@ -693,6 +731,9 @@ def skills_list(category: str = None, task_id: str = None) -> str:
             ensure_ascii=False,
         )
 
+    # 1.9 顶层兜底
+    # 任何意外都转成 tool_result 的 error 格式
+    # 不抛 — LLM 拿到的应该是可解析的 JSON,不是 Python 异常
     except Exception as e:
         return tool_error(str(e), success=False)
 
@@ -804,6 +845,23 @@ def _serve_plugin_skill(
     )
 
 
+# ────────────────────────────────────────────────────────────
+# 2.1 skill_view — Tier 2 入口(返 SKILL.md 完整内容 / 链接文件)
+# ────────────────────────────────────────────────────────────
+#
+# 角色:Skills 系统的"正文章节"。
+#      LLM 看到 skills_list 里有想用的 skill,调这个拿完整内容。
+#      可以加 file_path 参数拿 references/ templates/ assets/ 里的子文件。
+#
+# 设计:Progressive Disclosure Tier 2/3
+#      一次只返 1 个 skill 的内容(可能是几万 tokens 的 SKILL.md,
+#      或者一个 references 子文件)。按需加载,绝不一次塞所有 skill。
+#
+# 入口形态:2 种 name 格式
+#   "github-code-review"      → 本地 SKILLS_DIR 扫描
+#   "myplugin:some-skill"     → 插件命名空间分发
+#
+# 返回:JSON 字符串(走 LLM tool_result)
 def skill_view(
     name: str,
     file_path: str = None,
@@ -830,11 +888,13 @@ def skill_view(
         # ── Qualified name dispatch (plugin skills) ──────────────────
         # Names containing ':' are routed to the plugin skill registry.
         # Bare names fall through to the existing flat-tree scan below.
+        # 2.2 Plugin 分支:qualified name dispatch
         if ":" in name:
             from agent.skill_utils import is_valid_namespace, parse_qualified_name
             from hermes_cli.plugins import discover_plugins, get_plugin_manager
 
             namespace, bare = parse_qualified_name(name)
+            # 2.3 namespace 白名单校验([a-zA-Z0-9_-]+),防注入
             if not is_valid_namespace(namespace):
                 return json.dumps(
                     {
@@ -847,13 +907,13 @@ def skill_view(
                     ensure_ascii=False,
                 )
 
-            discover_plugins()  # idempotent
+            discover_plugins()  # idempotent — 2.4 插件查找
             pm = get_plugin_manager()
             plugin_skill_md = pm.find_plugin_skill(name)
 
             if plugin_skill_md is not None:
                 if not plugin_skill_md.exists():
-                    # Stale registry entry — file deleted out of band
+                    # 2.4a Stale 懒清理 — 文件没了就清注册表
                     pm.remove_plugin_skill(name)
                     return json.dumps(
                         {
@@ -867,7 +927,7 @@ def skill_view(
                         },
                         ensure_ascii=False,
                     )
-                return _serve_plugin_skill(
+                return _serve_plugin_skill(  # 2.4b 渲染插件 skill
                     plugin_skill_md,
                     namespace,
                     bare,
@@ -875,7 +935,7 @@ def skill_view(
                     session_id=task_id,
                 )
 
-            # Plugin exists but this specific skill is missing?
+            # 2.4c 插件存在但具体 skill 缺,列其他 skill 给 LLM
             available = pm.list_plugin_skills(namespace)
             if available:
                 return json.dumps(
@@ -892,11 +952,11 @@ def skill_view(
             # gateway prompts, so preserve that form and translate it to the
             # on-disk `category/skill` path during the local scan below.
             if bare:
-                local_category_name = f"{namespace}/{bare}"
+                local_category_name = f"{namespace}/{bare}"  # 2.4d plugin 缺注册,试本地分类路径
 
         from agent.skill_utils import get_external_skills_dirs
 
-        # Build list of all skill directories to search
+        # 2.5 构建搜索目录列表(本地 + 外部,本地优先)
         all_dirs = []
         if SKILLS_DIR.exists():
             all_dirs.append(SKILLS_DIR)
@@ -914,16 +974,13 @@ def skill_view(
         skill_dir = None
         skill_md = None
 
-        # Collision detection: collect ALL candidates across every dir using
-        # every lookup strategy (direct path, recursive by parent dir name,
-        # legacy flat <name>.md). If more than one matches, refuse and tell
-        # the caller — silent shadowing of a local skill by a same-named
-        # external skill is a real bug class (`/skills` shows one, agent
-        # loaded the other) so we surface it loudly instead of guessing.
+        # 2.6 冲突检测 — 收集所有候选,**不静默 shadow**
+        # 设计:多候选碰撞时拒绝猜测,返错让用户显式选
+        # silent shadowing 是真实 bug 类:`/skills` 显示一个,实际加载另一个
         from agent.skill_utils import iter_skill_index_files
 
         candidates: List[Tuple[Optional[Path], Path]] = []  # (skill_dir, skill_md)
-        seen_md: set = set()
+        seen_md: set = set()  # 用 resolve() 后的真实路径做 key
 
         def _record(sd: Optional[Path], smd: Path) -> None:
             try:
@@ -935,18 +992,17 @@ def skill_view(
             seen_md.add(key)
             candidates.append((sd, smd))
 
+        # 2.7 三种查找 strategy(每种都 try,收集所有命中)
         for search_dir in all_dirs:
-            # Strategy 1: direct path (e.g., "mlops/axolotl" or bare "axolotl"
-            # at the top of the dir).
+            # 2.7.1 Strategy 1: 直接路径(顶层 "axolotl" 或 "mlops/axolotl")
             direct_path = search_dir / name
             if direct_path.is_dir() and (direct_path / "SKILL.md").exists():
                 _record(direct_path, direct_path / "SKILL.md")
             elif direct_path.with_suffix(".md").exists():
                 _record(None, direct_path.with_suffix(".md"))
 
-            # Strategy 1b: categorized form for plugin namespace fall-through
-            # (e.g., a "myplugin:explore" name with no plugin registered also
-            # tries the on-disk path "myplugin/explore").
+            # 2.7.2 Strategy 1b: 分类路径(plugin namespace fall-through)
+            # 例:"myplugin:explore" 无插件注册,试本地 "myplugin/explore"
             if local_category_name:
                 categorized_path = search_dir / local_category_name
                 if categorized_path.is_dir() and (categorized_path / "SKILL.md").exists():
@@ -954,17 +1010,18 @@ def skill_view(
                 elif categorized_path.with_suffix(".md").exists():
                     _record(None, categorized_path.with_suffix(".md"))
 
-            # Strategy 2: recursive by directory name (catches nested skills
-            # like "foundations/runtime/explore-codebase" called by bare name).
+            # 2.7.3 Strategy 2: 递归按目录名找
+            # 适用:深层嵌套的 skill,如 "foundations/runtime/explore-codebase"
             for found_skill_md in iter_skill_index_files(search_dir, "SKILL.md"):
                 if found_skill_md.parent.name == name:
                     _record(found_skill_md.parent, found_skill_md)
 
-            # Strategy 3: legacy flat <name>.md files anywhere under the dir.
+            # 2.7.4 Strategy 3: 老 flat 格式 <name>.md(老式单文件 skill)
             for found_md in search_dir.rglob(f"{name}.md"):
-                if found_md.name != "SKILL.md":
+                if found_md.name != "SKILL.md":  # 排除 SKILL.md 自身
                     _record(None, found_md)
 
+        # 2.8 多候选 → 拒绝猜测,返错(不静默选第一个)
         if len(candidates) > 1:
             paths = [str(smd) for _, smd in candidates]
             logging.getLogger(__name__).warning(
@@ -989,6 +1046,7 @@ def skill_view(
                 ensure_ascii=False,
             )
 
+        # 2.9 单候选 → 采纳;空 → 返 not found 错误(附可用 skill)
         if candidates:
             skill_dir, skill_md = candidates[0]
 
@@ -1004,7 +1062,7 @@ def skill_view(
                 ensure_ascii=False,
             )
 
-        # Read the file once — reused for platform check and main content below
+        # 2.10 读全文(只读 1 次,platform 检查 + 主内容复用)
         try:
             content = skill_md.read_text(encoding="utf-8")
         except Exception as e:
@@ -1016,8 +1074,9 @@ def skill_view(
                 ensure_ascii=False,
             )
 
-        # Security: warn if skill is loaded from outside trusted directories
-        # (local skills dir + configured external_dirs are all trusted)
+        # 2.11 安全检查 1:位置验证 — 警告(非阻断)
+        # skill 不在 trusted 目录里 → 可能是 symlink 攻击 / 误装
+        # trusted = SKILLS_DIR + 配置的 external_dirs
         _outside_skills_dir = True
         _trusted_dirs = [SKILLS_DIR.resolve()]
         try:
@@ -1032,8 +1091,8 @@ def skill_view(
             except ValueError:
                 continue
 
-        # Security: detect common prompt injection patterns
-        # (pattern list at module level as _INJECTION_PATTERNS)
+        # 2.12 安全检查 2:prompt 注入检测(子串匹配 _INJECTION_PATTERNS)
+        # 误报可接受,漏报危险 — false positive 比 false negative 安全
         _content_lower = content.lower()
         _injection_detected = any(p in _content_lower for p in _INJECTION_PATTERNS)
 
@@ -1045,12 +1104,14 @@ def skill_view(
                 _warnings.append("skill content contains patterns that may indicate prompt injection")
             logging.getLogger(__name__).warning("Skill security warning for '%s': %s", name, "; ".join(_warnings))
 
+        # 2.13 解析 frontmatter(只 1 次,后面复用;失败兜底空 dict)
         parsed_frontmatter: Dict[str, Any] = {}
         try:
             parsed_frontmatter, _ = _parse_frontmatter(content)
         except Exception:
             parsed_frontmatter = {}
 
+        # 2.14 平台过滤(再次 — 防绕过 list 直接 view)
         if not skill_matches_platform(parsed_frontmatter):
             return json.dumps(
                 {
@@ -1061,7 +1122,7 @@ def skill_view(
                 ensure_ascii=False,
             )
 
-        # Check if the skill is disabled by the user
+        # 2.15 disabled 检查 — 用户配过禁用的不加载
         resolved_name = parsed_frontmatter.get("name", skill_md.parent.name)
         if _is_skill_disabled(resolved_name):
             return json.dumps(
@@ -1075,11 +1136,11 @@ def skill_view(
                 ensure_ascii=False,
             )
 
-        # If a specific file path is requested, read that instead
+        # 2.16 file_path 分支 — 加载 linked file(不是主 SKILL.md)
         if file_path and skill_dir:
             from tools.path_security import validate_within_dir, has_traversal_component
 
-            # Security: Prevent path traversal attacks
+            # 2.16.1 路径遍历防护 — 防 LLM 越权
             if has_traversal_component(file_path):
                 return json.dumps(
                     {
@@ -1092,7 +1153,7 @@ def skill_view(
 
             target_file = skill_dir / file_path
 
-            # Security: Verify resolved path is still within skill directory
+            # 2.16.2 软链攻击防御 — .resolve() 真实路径再校验
             traversal_error = validate_within_dir(target_file, skill_dir)
             if traversal_error:
                 return json.dumps(
@@ -1104,7 +1165,7 @@ def skill_view(
                     ensure_ascii=False,
                 )
             if not target_file.exists():
-                # List available files in the skill directory, organized by type
+                # 2.16.3 文件不存在 → 列所有可用文件(按类型分组,引导 LLM)
                 available_files = {
                     "references": [],
                     "templates": [],
@@ -1113,7 +1174,6 @@ def skill_view(
                     "other": [],
                 }
 
-                # Scan for all readable files
                 for f in skill_dir.rglob("*"):
                     if f.is_file() and f.name != "SKILL.md":
                         rel = str(f.relative_to(skill_dir))
@@ -1149,11 +1209,11 @@ def skill_view(
                     ensure_ascii=False,
                 )
 
-            # Read the file content
+            # 2.16.4 读 linked file 内容
             try:
                 content = target_file.read_text(encoding="utf-8")
             except UnicodeDecodeError:
-                # Binary file - return info about it instead
+                # 2.16.5 二进制文件 → 返元数据,不返内容
                 return json.dumps(
                     {
                         "success": True,
@@ -1176,22 +1236,25 @@ def skill_view(
                 ensure_ascii=False,
             )
 
-        # Reuse the parse from the platform check above
+        # 2.17 主 SKILL.md 路径开始 — 复用 2.13 已 parse 的 frontmatter
         frontmatter = parsed_frontmatter
 
-        # Get reference, template, asset, and script files if this is a directory-based skill
+        # 2.18 扫 4 类 linked 目录(agentskills.io 标准)
+        # references/ templates/ assets/ scripts/ 都是约定俗成的子目录
         reference_files = []
         template_files = []
         asset_files = []
         script_files = []
 
         if skill_dir:
+            # 2.18.1 references/ — 支持文档(只 .md)
             references_dir = skill_dir / "references"
             if references_dir.exists():
                 reference_files = [
                     str(f.relative_to(skill_dir)) for f in references_dir.glob("*.md")
                 ]
 
+            # 2.18.2 templates/ — 模板(多种扩展名)
             templates_dir = skill_dir / "templates"
             if templates_dir.exists():
                 for ext in [
@@ -1210,13 +1273,14 @@ def skill_view(
                         ]
                     )
 
-            # assets/ — agentskills.io standard directory for supplementary files
+            # 2.18.3 assets/ — 资源文件(任意类型,agentskills.io 标准)
             assets_dir = skill_dir / "assets"
             if assets_dir.exists():
                 for f in assets_dir.rglob("*"):
                     if f.is_file():
                         asset_files.append(str(f.relative_to(skill_dir)))
 
+            # 2.18.4 scripts/ — 可执行脚本
             scripts_dir = skill_dir / "scripts"
             if scripts_dir.exists():
                 for ext in ["*.py", "*.sh", "*.bash", "*.js", "*.ts", "*.rb"]:
@@ -1224,8 +1288,8 @@ def skill_view(
                         [str(f.relative_to(skill_dir)) for f in scripts_dir.glob(ext)]
                     )
 
-        # Read tags/related_skills with backward compat:
-        # Check metadata.hermes.* first (agentskills.io convention), fall back to top-level
+        # 2.19 tags / related_skills(backward compat)
+        # 优先 metadata.hermes.* (agentskills.io 约定),兜底 top-level(老格式)
         hermes_meta = {}
         metadata = frontmatter.get("metadata")
         if isinstance(metadata, dict):
@@ -1236,7 +1300,7 @@ def skill_view(
             hermes_meta.get("related_skills") or frontmatter.get("related_skills", "")
         )
 
-        # Build linked files structure for clear discovery
+        # 2.20 拼装 linked_files dict — 给 LLM 一眼看到"这 skill 有这些资源"
         linked_files = {}
         if reference_files:
             linked_files["references"] = reference_files
@@ -1247,26 +1311,32 @@ def skill_view(
         if script_files:
             linked_files["scripts"] = script_files
 
+        # 2.21 算 relative path(展示用,fallback 用父级)
         try:
             rel_path = str(skill_md.relative_to(SKILLS_DIR))
         except ValueError:
-            # External skill — use path relative to the skill's own parent dir
+            # External skill — 用自己的父级做相对
             rel_path = str(skill_md.relative_to(skill_md.parent.parent)) if skill_md.parent.parent else skill_md.name
         skill_name = frontmatter.get(
             "name", skill_md.stem if not skill_dir else skill_dir.name
         )
+        # 2.22 环境变量 / 凭证捕获
+        # legacy_env_vars: prerequisites.env_vars 老格式
+        # required_env_vars: 规范化后的"必需"列表
         legacy_env_vars, _ = _collect_prerequisite_values(frontmatter)
         required_env_vars = _get_required_environment_variables(
             frontmatter, legacy_env_vars
         )
         backend = _get_terminal_backend_name()
         env_snapshot = load_env()
+        # 2.22.1 找"缺"的 env var(optional 跳过 + 已持久化跳过)
         missing_required_env_vars = [
             e
             for e in required_env_vars
             if not e.get("optional")
             and not _is_env_var_persisted(e["name"], env_snapshot)
         ]
+        # 2.22.2 捕获 — mark "需要 setup"(实际弹窗输入由调用方处理)
         capture_result = _capture_required_environment_variables(
             skill_name,
             missing_required_env_vars,
@@ -1280,9 +1350,8 @@ def skill_view(
         )
         setup_needed = bool(remaining_missing_required_envs)
 
-        # Register available skill env vars so they pass through to sandboxed
-        # execution environments (execute_code, terminal).  Only vars that are
-        # actually set get registered — missing ones are reported as setup_needed.
+        # 2.23 注册"已存在"的 env var → 沙箱透传(execute_code / terminal)
+        # 只注册"已经设置"的,缺的不注册(在 setup_needed 里高亮)
         available_env_names = [
             e["name"]
             for e in required_env_vars
@@ -1300,9 +1369,8 @@ def skill_view(
                     exc_info=True,
                 )
 
-        # Register credential files for mounting into remote sandboxes
-        # (Modal, Docker).  Files that exist on the host are registered;
-        # missing ones are added to the setup_needed indicators.
+        # 2.24 注册凭证文件 → 远程沙箱挂载(Modal / Docker)
+        # 存在的注册,缺的高亮在 setup_needed
         required_cred_files_raw = frontmatter.get("required_credential_files", [])
         if not isinstance(required_cred_files_raw, list):
             required_cred_files_raw = []
@@ -1321,6 +1389,7 @@ def skill_view(
                     exc_info=True,
                 )
 
+        # 2.25 预处理(模板变量 + 内联 shell,默认 shell 关)
         rendered_content = content
         if preprocess:
             try:
@@ -1336,6 +1405,7 @@ def skill_view(
                     "Could not preprocess skill content for %s", skill_name, exc_info=True
                 )
 
+        # 2.26 拼装最终结果(LLM 看到的就是这个 dict)
         result = {
             "success": True,
             "name": skill_name,

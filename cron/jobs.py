@@ -1,8 +1,31 @@
+#!/usr/bin/env python3
 """
-Cron job storage and management.
-
-Jobs are stored in ~/.hermes/cron/jobs.json
-Output is saved to ~/.hermes/cron/output/{job_id}/{timestamp}.md
+# ============================================================
+# Cron Jobs —— 任务存储 / 调度 / 生命周期管理
+# ============================================================
+# 1.1 本文件做什么
+# ------------------------------------------------------------
+#   把"cron job"作为一个完整的业务对象管理:
+#     - CRUD(create / read / update / delete)
+#     - 调度解析(cron 表达式 → 下次运行时间)
+#     - 状态流转(pause / resume / trigger / run / advance)
+#     - 持久化(写到 ~/.hermes/cron/jobs.json)
+#
+# 1.2 存储位置
+# ------------------------------------------------------------
+#   jobs   → ~/.hermes/cron/jobs.json        (本文件管)
+#   output → ~/.hermes/cron/output/<job_id>/<timestamp>.md  (save_job_output 管)
+#
+# 1.3 文件组织
+# ------------------------------------------------------------
+#   1.x 模块头 + 配置常量 + 锁
+#   2.x 内部 helpers(_job_output_dir / normalize / secure_* / parse_duration / parse_schedule)
+#   3.x 调度计算(compute_next_run / _ensure_aware / _recoverable_oneshot_run_at)
+#   4.x 持久化(load_jobs / save_jobs)
+#   5.x CRUD(create_job / get_job / list_jobs / update_job / pause_job / resume_job / remove_job)
+#   6.x 运行时状态(mark_job_run / advance_next_run / get_due_jobs)
+#   7.x 输出与重写(save_job_output / rewrite_skill_refs)
+# ============================================================
 """
 
 import copy

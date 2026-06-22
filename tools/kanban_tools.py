@@ -1,31 +1,38 @@
-"""Kanban tools — structured tool-call surface for worker + orchestrator agents.
-
-These tools are registered into the model's schema when the agent is
-running under the dispatcher (env var ``HERMES_KANBAN_TASK`` set) or when
-the active profile explicitly enables the ``kanban`` toolset for
-orchestrator work. A normal ``hermes chat`` session still sees **zero**
-kanban tools in its schema unless configured.
-
-Why tools instead of just shelling out to ``hermes kanban``?
-
-1. **Backend portability.** A worker whose terminal tool points at Docker
-   / Modal / Singularity / SSH would run ``hermes kanban complete …``
-   inside the container, where ``hermes`` isn't installed and the DB
-   isn't mounted. Tools run in the agent's Python process, so they
-   always reach ``~/.hermes/kanban.db`` regardless of terminal backend.
-
-2. **No shell-quoting footguns.** Passing ``--metadata '{"x": [...]}'``
-   through shlex+argparse is fragile. Structured tool args skip it.
-
-3. **Better errors.** Tool-call failures return structured JSON the
-   model can reason about, not stderr strings it has to parse.
-
-Humans continue to use the CLI (``hermes kanban …``), the dashboard
-(``hermes dashboard``), and the slash command (``/kanban …``) — all
-three bypass the agent entirely. The tools are for dispatcher-spawned
-worker handoffs and for configured orchestrator profiles that route work
-through the board.
+#!/usr/bin/env python3
 """
+# ============================================================
+# Kanban Tools —— 结构化 tool-call 表面(代替 shell 调 hermes kanban)
+# ============================================================
+# 1.1 本文件做什么
+# ------------------------------------------------------------
+#   1) 提供一组 kanban 操作的 tool(complete / block / heartbeat / list / ...)
+#   2) LLM 通过 tool call 直接推进 kanban 任务,不用 shell 调 `hermes kanban` CLI
+#
+# 1.2 触发条件(谁能看到这些 tool?)
+# ------------------------------------------------------------
+#   普通 `hermes chat` 用户 → 看不到任何 kanban tool
+#   dispatcher 起的 worker(HERMES_KANBAN_TASK env 有值)→ 看到 task-lifecycle tool
+#   orchestrator profile(config toolsets 含 "kanban" + 没 env)→ 看到 board-routing tool
+#
+# 1.3 为什么是 tool 而不是 shell CLI
+# ------------------------------------------------------------
+#   1) Backend portability:worker 可能跑在 Docker / Modal / SSH 里,
+#      那里没装 `hermes`,DB 也没 mount;tool 跑在 agent Python 进程里,
+#      直接连 `~/.hermes/kanban.db`
+#   2) 无 shell 转义噩梦:metadata 这种 JSON 走 shlex+argparse 容易爆
+#   3) 错误处理:tool 返结构化 JSON,shell 返 stderr 字符串
+#
+# 1.4 文件组织(6 大块)
+# ------------------------------------------------------------
+#   1.x 模块头 + Gating(模式判断)
+#   2.x 共享 helpers(task_id 解析 / 所有权校验 / DB 连接 / 响应辅助)
+#   3.x Auto-heartbeat bridge(runtime activity → 看板心跳)
+#   4.x 9 个 _handle_* tool handlers(show / list / complete / block / heartbeat / comment / create / unblock / link)
+#   5.x _board_schema_prop()(大函数,~445 行,定义 board 参数的 enum)
+#   6.x Schema 定义 + registry 注册
+# ============================================================
+"""
+
 from __future__ import annotations
 
 import json
@@ -39,13 +46,22 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Gating
+# 1.5 Gating(两种模式 + 两个常量)
 # ---------------------------------------------------------------------------
-
+# 这两个常量是分页参数上限:
+#   - KANBAN_LIST_DEFAULT_LIMIT:list tool 默认返多少条
+#   - KANBAN_LIST_MAX_LIMIT:list tool 最多能返多少条(防 LLM 一次拉太多)
 KANBAN_LIST_DEFAULT_LIMIT = 50
 KANBAN_LIST_MAX_LIMIT = 200
 
 
+# 1.6 _profile_has_kanban_toolset —— 检查当前 profile 是否启用了 kanban toolset
+# ---------------------------------------------------------------------------
+# 读取顺序:hermes_cli.config.load_config() → cfg.get("toolsets", [])
+# 然后看 "kanban" 在不在里面
+# 性能:load_config() 内部有 mtime 缓存,几乎无开销
+# 进一步:tool registry 还会对 check_fn 结果做 ~30s TTL 缓存
+# 兜底:任何异常都返 False(宁可看不到,不让 tool 加载崩)
 def _profile_has_kanban_toolset() -> bool:
     # Uses load_config() which has mtime-based caching, so this adds
     # negligible overhead. The check_fn results are further TTL-cached
@@ -59,6 +75,17 @@ def _profile_has_kanban_toolset() -> bool:
         return False
 
 
+# 1.7 _check_kanban_mode —— task-lifecycle tool 的总开关
+# ---------------------------------------------------------------------------
+# 触发条件(任一):
+#   1) env HERMES_KANBAN_TASK 有值 → dispatcher 起的 worker
+#   2) profile 启用了 kanban toolset → orchestrator profile
+#
+# 看到的 tool:task 生命周期(complete / block / heartbeat)
+# 不看到:board 路由(list / unblock / create / link)
+#
+# 设计原则:普通 hermes chat 用户什么都看不到
+#  设计原则:worker 看不到 board 路由(避免它瞎搞别的任务)
 def _check_kanban_mode() -> bool:
     """Task-lifecycle tools are available when:
 
@@ -76,6 +103,17 @@ def _check_kanban_mode() -> bool:
     return _profile_has_kanban_toolset()
 
 
+# 1.8 _check_kanban_orchestrator_mode —— board-routing tool 的总开关
+# ---------------------------------------------------------------------------
+# 与 _check_kanban_mode 的关键区别:
+#   - dispatcher 起的 worker → False(看不到)
+#   - orchestrator profile(无 env)→ True(看得到)
+#
+# 看到的 tool:board 路由(list / unblock / create / link)
+# 不看到:task 生命周期(complete / block / heartbeat)
+#
+# 为什么不互斥?一个 process 可能两种 tool 都看不到(_check_kanban_mode 返 False
+# + _check_kanban_orchestrator_mode 也返 False = 普通用户),也可能只看到一种
 def _check_kanban_orchestrator_mode() -> bool:
     """Board-routing tools (kanban_list, kanban_unblock) are intentionally
     hidden from task workers.
@@ -94,6 +132,15 @@ def _check_kanban_orchestrator_mode() -> bool:
 # Shared helpers
 # ---------------------------------------------------------------------------
 
+# 2.1 _default_task_id —— 解析 task_id 参数
+# ---------------------------------------------------------------------------
+# 优先级:
+#   1) 调用方显式传的 arg(最高)
+#   2) dispatcher 设的 env var HERMES_KANBAN_TASK
+#   3) None(都没有)
+#
+# 用法:worker agent 调 kanban_complete() 不传 task_id 时,
+#       自动用 env 里的(因为 dispatcher 把自己负责的 task 注入 env 了)
 def _default_task_id(arg: Optional[str]) -> Optional[str]:
     """Resolve ``task_id`` arg or fall back to the env var the dispatcher set."""
     if arg:
@@ -102,6 +149,14 @@ def _default_task_id(arg: Optional[str]) -> Optional[str]:
     return env_tid or None
 
 
+# 2.2 _worker_run_id —— 拿 dispatcher 给这个 worker 注入的 run id
+# ---------------------------------------------------------------------------
+# 作用:把"哪次 dispatcher run 启的 worker"和"task"关联起来
+# 流程:
+#   1) 先确认 env 里的 HERMES_KANBAN_TASK 就是这个 task_id(防御性)
+#   2) 再读 HERMES_KANBAN_RUN_ID,转 int
+#   3) 失败返 None
+# 注意:env 不匹配或 RUN_ID 不是数字都返 None(不抛)
 def _worker_run_id(task_id: str) -> Optional[int]:
     """Return this worker's dispatcher run id when it is scoped to task_id."""
     if os.environ.get("HERMES_KANBAN_TASK") != task_id:
@@ -115,6 +170,16 @@ def _worker_run_id(task_id: str) -> Optional[int]:
         return None
 
 
+# 2.3 _stamp_worker_session_metadata —— 给 worker 的 metadata 打"会话 id"戳
+# ---------------------------------------------------------------------------
+# 流程:
+#   1) 先确认 env 里的 task 就是这个(防御性)
+#   2) 读 HERMES_SESSION_ID(当前 agent 的 session id)
+#   3) 加进 metadata 字典(key="worker_session_id")
+#
+# "trusted":这个字段是 server-side 注入的,worker LLM 自己改不了
+# (不像 metadata 其它字段 LLM 能自由填)
+# 用途:事后看"哪个 session 跑了哪个 task"做审计
 def _stamp_worker_session_metadata(
     task_id: str, metadata: Optional[dict]
 ) -> Optional[dict]:
@@ -129,6 +194,24 @@ def _stamp_worker_session_metadata(
     return stamped
 
 
+# 2.4 _enforce_worker_task_ownership —— worker 只能改自己的 task(安全护栏)
+# ---------------------------------------------------------------------------
+# 关键安全设计(issue #19534):
+#   背景:dispatcher 起的 worker 在 env 里设了 HERMES_KANBAN_TASK = 自己负责的 task
+#        kanban_complete / block / heartbeat 这些 tool 会改 run lifecycle
+#   风险:LLM 可能被 prompt injection 骗去调 complete(task_id="别人的 task")
+#        → 跨租户 / 跨任务污染
+#   修复:worker 调这些 tool 时,显式检查 task_id 必须等于 env 里的
+#
+# 不拦谁:
+#   - Orchestrator profile(env 里没 HERMES_KANBAN_TASK)→ 返 None 放行
+#     (orchestrator 的活就是路由,有时合法 close 别人的 task)
+#
+# 返值约定:
+#   - None = 允许
+#   - str = tool_error 消息,调用方直接 return 这个
+#
+# 提示被拒的 worker:用 kanban_comment 跟别的 task 通信 / kanban_create 开新 task
 def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     """Reject worker-driven destructive calls on foreign task IDs.
 
@@ -161,6 +244,20 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     return None
 
 
+# 2.5 _connect —— 延迟导入 + 创建 DB 连接
+# ---------------------------------------------------------------------------
+# 为什么延迟导入 hermes_cli.kanban_db:
+#   - 测试 rig 可能 import 所有 tool module(本文件就在内)
+#   - 如果顶层 import kanban_db,可能拖一堆依赖 / 报错
+#   - 延迟到真正用时再 import,普通 import 干净
+#
+# board 参数(可选):
+#   - 给了 → kb.connect(board=xxx) → 用指定 board 的 sqlite 文件
+#   - None → 走 legacy 解析链:
+#       HERMES_KANBAN_DB env → HERMES_KANBAN_BOARD env → current symlink → "default"
+#   - 用途:Telegram-side agent 想切 board 不用重启 Hermes
+#
+# 返 (kb_module, connection) 让调用方既能用 kb.xxx 函数又能直接用 conn
 def _connect(board: Optional[str] = None):
     """Import + connect lazily so the module imports cleanly in non-kanban
     contexts (e.g. test rigs that import every tool module).
@@ -201,6 +298,40 @@ _AUTO_HEARTBEAT_MIN_INTERVAL_SECONDS = 60.0
 _auto_heartbeat_last_attempt: float = 0.0
 
 
+# ===========================================================================
+# 3. heartbeat_current_worker_from_env —— runtime activity → 看板心跳桥
+# ===========================================================================
+# 3.1 背景(为什么需要这个)
+# ---------------------------------------------------------------------------
+# 现状:
+#   - dispatcher 看 `tasks.last_heartbeat_at` 判断 worker 是否还活着
+#   - 但 agent 自己的 _touch_activity 是在 Python 进程内的字段,
+#     不写到 DB
+#   - 如果 dispatcher 只看 DB 的字段,真正在跑的 worker 可能被当成 stale
+#
+# 解法:agent 调 _touch_activity 时,顺手调一次这个函数,
+#       把"我还活着"也写一份到 DB 的 last_heartbeat_at
+#
+# 3.2 关键约束
+# ---------------------------------------------------------------------------
+#   - Best-effort:任何异常都吞掉,只 log debug
+#     (agent loop 不能因为看板心跳失败崩)
+#   - Rate-limited:每 60s 最多写一次 DB(防止每次 chunk / tool result 都写)
+#   - 只在 dispatcher worker 上下文里做(env 有 HERMES_KANBAN_TASK)
+#   - 不写持久化 note(留给显式 kanban_heartbeat tool,那个带 model 注释)
+#
+# 3.3 身份来源(env vars)
+# ---------------------------------------------------------------------------
+#   - HERMES_KANBAN_TASK:task id(必须有,缺了就 return False)
+#   - HERMES_KANBAN_RUN_ID:pin 当前 run,防心跳打到 stale run 上
+#   - HERMES_KANBAN_CLAIM_LOCK:heartbeat_claim 的 claimer id,
+#     fallback 到 _claimer_id()(本地起的 worker 没走 dispatcher)
+#
+# 3.4 返值约定
+# ---------------------------------------------------------------------------
+# True = "尝试了一次 DB 写"(不管成功失败)
+# False = "这次跳过了"(不是 kanban worker / 距离上次 < 60s / 异常吞了)
+# 调用方**不应该**根据这个返回值走分支
 def heartbeat_current_worker_from_env() -> bool:
     """Best-effort: extend the kanban claim + bump board heartbeat for the
     current dispatcher-spawned worker, using identity from env vars.
@@ -223,9 +354,12 @@ def heartbeat_current_worker_from_env() -> bool:
     the worst case is one extra DB write per race, which is harmless.
     """
     global _auto_heartbeat_last_attempt
+    # 3.5 快速早返:不是 dispatcher worker(没 env)→ 不做
     tid = os.environ.get("HERMES_KANBAN_TASK")
     if not tid:
         return False
+    # 3.6 限频:monotonic clock 检查距离上次心跳 < 60s → 跳过
+    # 用 monotonic 不是 wall clock,防系统时钟跳变影响
     import time as _time
     now = _time.monotonic()
     if (now - _auto_heartbeat_last_attempt) < _AUTO_HEARTBEAT_MIN_INTERVAL_SECONDS:
@@ -260,10 +394,24 @@ def heartbeat_current_worker_from_env() -> bool:
         return False
 
 
+# 2.6 _ok —— 构造"成功"响应的辅助函数
+# ---------------------------------------------------------------------------
+# 统一所有 tool 的成功响应格式:
+#   {"ok": true, ...fields}
+# 返 JSON 字符串(给 LLM 看的 tool result)
+# 用法:return _ok(task_id="abc", status="completed")
 def _ok(**fields: Any) -> str:
     return json.dumps({"ok": True, **fields})
 
 
+# 2.7 _normalize_profile —— 规范化 assignee / profile 字符串
+# ---------------------------------------------------------------------------
+# 设计:CLI 端接受各种"无 assignee"的写法(None / "-" / "null" / "")
+#     tool 端统一存 None,DB 拿到的也是 None
+# 流程:
+#   - value is None → None
+#   - 空字符串 / "none" / "-" / "null"(大小写不敏感)→ None
+#   - 其他原样返回(strip 过的)
 def _normalize_profile(value: Any) -> Optional[str]:
     """Normalize CLI-compatible assignee sentinels for the tool surface."""
     if value is None:
@@ -274,6 +422,21 @@ def _normalize_profile(value: Any) -> Optional[str]:
     return text
 
 
+# 2.8 _parse_bool_arg —— 鲁棒地解析布尔参数
+# ---------------------------------------------------------------------------
+# 工具调用时 LLM 可能传:
+#   - 真正的 bool:True / False
+#   - 字符串:"true" / "false" / "1" / "0" / "yes" / "no"
+#   - 没传(None)→ 用 default
+#   - 乱七八糟的值 → 返 (default, 错误消息)
+#
+# 返值:(value, error_or_None)
+#   - 成功:(True/False, None)
+#   - 失败:(default, "xxx must be a boolean or 'true'/'false'")
+#
+# 调用方通常这么用:
+#   value, err = _parse_bool_arg(args, "include_done")
+#   if err: return tool_error(err)
 def _parse_bool_arg(args: dict, name: str, *, default: bool = False):
     value = args.get(name)
     if value is None:
@@ -288,6 +451,15 @@ def _parse_bool_arg(args: dict, name: str, *, default: bool = False):
     return default, f"{name} must be a boolean or 'true'/'false'"
 
 
+# 2.9 _require_orchestrator_tool —— orchestrator-only tool 的运行时护栏
+# ---------------------------------------------------------------------------
+# 双保险(belt-and-suspenders):
+#   - 第一道:check_fn(_check_kanban_orchestrator_mode)把 orchestrator-only tool
+#            排除出 worker 的 schema(worker 看不到)
+#   - 第二道:万一 stale registration / test harness 路由错了,
+#            这里再 runtime 校验一次
+# 防止:stale schema / test 直接调 / 配置漂移导致 worker 能调 orchestrator tool
+# 返值约定:同 _enforce_worker_task_ownership(None=放行,str=tool_error)
 def _require_orchestrator_tool(tool_name: str) -> Optional[str]:
     """Belt-and-suspenders runtime guard for orchestrator-only handlers.
 
@@ -306,6 +478,17 @@ def _require_orchestrator_tool(tool_name: str) -> Optional[str]:
     return None
 
 
+# 2.10 _task_summary_dict —— 把 task row 转成 LLM-friendly dict
+# ---------------------------------------------------------------------------
+# 用途:list / search 等工具返多个 task 时,用这个统一格式化
+# 包含:
+#   - 基本字段(id / title / assignee / status / priority / ...)
+#   - 时间字段(created_at / started_at / completed_at)
+#   - 关系字段(parents / children + 各自 count)
+# 为什么不返 ORM 对象 / Row:
+#   - tool result 必须是 JSON 可序列化的
+#   - LLM 看到 dict 比看到 ORM 对象直观
+#   - 字段顺序 / 命名可控
 def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
     """Compact task shape for board-listing tools."""
     parents = kb.parent_ids(conn, task.id)
@@ -336,7 +519,40 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
 # Handlers
 # ---------------------------------------------------------------------------
 
-def _handle_show(args: dict, **kw) -> str:
+# ===========================================================================
+# 4. 9 个 _handle_* tool handlers —— 实际响应 tool call 的函数
+# ===========================================================================
+# 4.1 共同模式
+# ---------------------------------------------------------------------------
+# 每个 handler 都是同样的 6 步模板:
+#   1) 解析 args(task_id / board 等)
+#   2) 必要时调用 _enforce_worker_task_ownership / _require_orchestrator_tool
+#   3) 调 _connect(board=...) 拿 kb + conn
+#   4) 调 kanban_db 函数做实际 DB 操作
+#   5) 用 _ok() / _task_summary_dict() 拼响应
+#   6) 用 try/finally 关 conn
+#
+# 4.2 9 个 handler 速查
+# ---------------------------------------------------------------------------
+# 4.2.1  _handle_show       —— 看单个 task 的完整状态(row + parents + children + comments + runs + events)
+# 4.2.2  _handle_list       —— 搜索/列多个 task(支持 status / assignee / priority / text 过滤 + 分页)
+# 4.2.3  _handle_complete   —— 标 task 完成(带 result / artifacts / metadata)
+# 4.2.4  _handle_block      —— 标 task 阻塞(带 reason,触发 watchdog 注意)
+# 4.2.5  _handle_heartbeat  —— 显式心跳(可带 note + 延长 claim)
+# 4.2.6  _handle_comment    —— 给 task 加评论(worker 跨任务通信用)
+# 4.2.7  _handle_create     —— 创建新 task(orchestrator / worker 都能用)
+# 4.2.8  _handle_unblock    —— 解锁被 block 的 task(orchestrator-only)
+# 4.2.9  _handle_link       —— 建立 task 间 parent/child 链接
+#
+# 4.3 谁能看到
+# ---------------------------------------------------------------------------
+#   Worker(lifecycle):complete / block / heartbeat / comment / show / list
+#   Orchestrator(routing):create / unblock / link / list / show
+#   check_fn(_check_kanban_mode / _check_kanban_orchestrator_mode)控制 schema 注册
+# ===========================================================================
+
+
+def _handle_show(args: dict, **kw) -> str:  # 4.2.1
     """Read a task's full state: task row, parents, children, comments,
     runs (attempt history), and the last N events."""
     tid = _default_task_id(args.get("task_id"))
@@ -412,7 +628,7 @@ def _handle_show(args: dict, **kw) -> str:
         return tool_error(f"kanban_show: {e}")
 
 
-def _handle_list(args: dict, **kw) -> str:
+def _handle_list(args: dict, **kw) -> str:  # 4.2.2
     """List task summaries with the same core filters as the CLI."""
     guard = _require_orchestrator_tool("kanban_list")
     if guard:
@@ -473,7 +689,7 @@ def _handle_list(args: dict, **kw) -> str:
         return tool_error(f"kanban_list: {e}")
 
 
-def _handle_complete(args: dict, **kw) -> str:
+def _handle_complete(args: dict, **kw) -> str:  # 4.2.3
     """Mark the current task done with a structured handoff."""
     tid = _default_task_id(args.get("task_id"))
     if not tid:
@@ -595,7 +811,7 @@ def _handle_complete(args: dict, **kw) -> str:
         return tool_error(f"kanban_complete: {e}")
 
 
-def _handle_block(args: dict, **kw) -> str:
+def _handle_block(args: dict, **kw) -> str:  # 4.2.4
     """Transition the task to blocked with a reason a human will read."""
     tid = _default_task_id(args.get("task_id"))
     if not tid:
@@ -633,7 +849,7 @@ def _handle_block(args: dict, **kw) -> str:
         return tool_error(f"kanban_block: {e}")
 
 
-def _handle_heartbeat(args: dict, **kw) -> str:
+def _handle_heartbeat(args: dict, **kw) -> str:  # 4.2.5
     """Signal that the worker is still alive during a long operation.
 
     Extends the claim TTL via ``heartbeat_claim`` AND records a heartbeat
@@ -684,7 +900,7 @@ def _handle_heartbeat(args: dict, **kw) -> str:
         return tool_error(f"kanban_heartbeat: {e}")
 
 
-def _handle_comment(args: dict, **kw) -> str:
+def _handle_comment(args: dict, **kw) -> str:  # 4.2.6
     """Append a comment to a task's thread."""
     tid = args.get("task_id")
     if not tid:
@@ -720,7 +936,7 @@ def _handle_comment(args: dict, **kw) -> str:
         return tool_error(f"kanban_comment: {e}")
 
 
-def _handle_create(args: dict, **kw) -> str:
+def _handle_create(args: dict, **kw) -> str:  # 4.2.7
     """Create a child task. Orchestrator workers use this to fan out.
 
     ``parents`` can be a list of task ids; dependency-gated promotion
@@ -812,7 +1028,7 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(f"kanban_create: {e}")
 
 
-def _handle_unblock(args: dict, **kw) -> str:
+def _handle_unblock(args: dict, **kw) -> str:  # 4.2.8
     """Transition a blocked task back to ready."""
     guard = _require_orchestrator_tool("kanban_unblock")
     if guard:
@@ -840,7 +1056,7 @@ def _handle_unblock(args: dict, **kw) -> str:
         return tool_error(f"kanban_unblock: {e}")
 
 
-def _handle_link(args: dict, **kw) -> str:
+def _handle_link(args: dict, **kw) -> str:  # 4.2.9
     """Add a parent→child dependency edge after the fact."""
     parent_id = args.get("parent_id")
     child_id = args.get("child_id")
@@ -860,6 +1076,35 @@ def _handle_link(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_link failed")
         return tool_error(f"kanban_link: {e}")
+
+
+# ===========================================================================
+# 5. Schemas + _board_schema_prop() —— OpenAI function-calling 的 schema 定义
+# ===========================================================================
+# 5.1 这一段做什么
+# ---------------------------------------------------------------------------
+# 9 个 tool handler 都要对应一个 OpenAI-compatible schema 定义:
+#   - name / description / parameters(每个 tool 都有自己接受的参数)
+# 这些 schema 在 6.x 通过 registry.register() 装到工具注册表里。
+#
+# 5.2 为什么 _board_schema_prop() 占 445 行
+# ---------------------------------------------------------------------------
+# `board` 参数的 description 要枚举所有合法 board 名(避免 LLM 拼错)。
+# 合法 board 名是**运行时**才知道的(用户在 ~/.hermes/kanban-boards/ 里建),
+# 所以这里动态枚举 + cache,而不是写死。
+#
+# 5.3 schema 列表
+# ---------------------------------------------------------------------------
+# 5.3.1  KANBAN_SHOW_SCHEMA         show tool 的 schema
+# 5.3.2  KANBAN_LIST_SCHEMA         list tool 的 schema
+# 5.3.3  KANBAN_COMPLETE_SCHEMA     complete tool 的 schema
+# 5.3.4  KANBAN_BLOCK_SCHEMA        block tool 的 schema
+# 5.3.5  KANBAN_HEARTBEAT_SCHEMA    heartbeat tool 的 schema
+# 5.3.6  KANBAN_COMMENT_SCHEMA      comment tool 的 schema
+# 5.3.7  KANBAN_CREATE_SCHEMA       create tool 的 schema
+# 5.3.8  KANBAN_UNBLOCK_SCHEMA      unblock tool 的 schema
+# 5.3.9  KANBAN_LINK_SCHEMA         link tool 的 schema
+# ===========================================================================
 
 
 # ---------------------------------------------------------------------------
@@ -1324,6 +1569,38 @@ KANBAN_LINK_SCHEMA = {
         "required": ["parent_id", "child_id"],
     },
 }
+
+
+# ===========================================================================
+# 6. Registration —— 把 9 个 tool 装到 registry
+# ===========================================================================
+# 6.1 统一模式
+# ---------------------------------------------------------------------------
+# 每个 tool 都通过 `registry.register(...)` 装上,传 4 个核心字段:
+#   - name     : tool 标识(LLM 在 tool_call 里写的)
+#   - toolset  : 归属工具集(这里都是 "kanban")
+#   - schema   : OpenAI function-calling schema(见 5.x)
+#   - handler  : 实际执行函数(见 4.x)
+#   - check_fn : 可选,运行时闸门(worker / orchestrator 模式分开)
+#
+# 6.2 9 个 register 调用一览
+# ---------------------------------------------------------------------------
+# 6.2.1  kanban_show       worker + orchestrator 都可见(check_fn 不卡)
+# 6.2.2  kanban_list       orchestrator-only(用 _check_kanban_orchestrator_mode)
+# 6.2.3  kanban_complete   worker + orchestrator
+# 6.2.4  kanban_block      worker + orchestrator
+# 6.2.5  kanban_heartbeat  worker + orchestrator(显式心跳)
+# 6.2.6  kanban_comment    worker + orchestrator(跨任务通信)
+# 6.2.7  kanban_create     orchestrator-only(开新任务)
+# 6.2.8  kanban_unblock    orchestrator-only(解锁 task)
+# 6.2.9  kanban_link       orchestrator-only(建 parent/child 关系)
+#
+# 6.3 check_fn 模式
+# ---------------------------------------------------------------------------
+# 大部分 lifecycle tool 用 `_check_kanban_mode`,
+# routing tool 用 `_check_kanban_orchestrator_mode`,
+# 通过 env / config 决定要不要把这 tool 装进 schema。
+# ===========================================================================
 
 
 # ---------------------------------------------------------------------------

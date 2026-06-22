@@ -633,22 +633,69 @@ def _expand_parent_toolsets(parent_toolsets: set) -> set:
     the names of any individual toolsets whose tools are a *subset* of the
     parent's available tools.  The original parent toolset names are preserved.
     """
+    # ===========================================================================
+    # 5.8.1 用一个具体例子走一遍
+    # ===========================================================================
+    # 假设父的 toolsets = {"hermes-cli"}
+    # "hermes-cli" 是个 composite toolset,在 TOOLSETS 字典里定义:
+    #     "hermes-cli": {"tools": ["shell", "read_file", "edit_file", "web_search", ...]}
+    #
+    # LLM 调 delegate_task(toolsets=["terminal"]) —— 它想给子 "terminal" toolset
+    # "terminal" 在 TOOLSETS 里也是单独条目:
+    #     "terminal": {"tools": ["shell", "run_command", "send_input"]}
+    #
+    # 简单按名字求交集:{"terminal"} & {"hermes-cli"} = {}  ← 空!子什么都拿不到
+    # 但显然"父的 hermes-cli 里**已经包含** shell 工具,子应该能拿到 terminal"
+    #
+    # 这个函数做的事就是:让 {"terminal"} 这种"具名"toolset 在
+    # 父用 {"hermes-cli"} 这种"composite"时也能被识别
+    # ===========================================================================
+
+    # 5.8.2 第一步:把父所有 toolset 的 **tool 名** 摊平到一个 set
+    # ---------------------------------------------------------------------------
+    # 父 = {"hermes-cli"}
+    # → parent_tool_names = {"shell", "read_file", "edit_file", "web_search", ...}
+    # 这就是"父实际上能用的所有 tool"
     parent_tool_names: set = set()
     for ts_name in parent_toolsets:
         ts_def = TOOLSETS.get(ts_name)
         if ts_def:
+            # ts_def.get("tools", []) —— toolset 里所有 tool 的名字
+            # .update() —— 把这些名字全加进 set(自动去重)
             parent_tool_names.update(ts_def.get("tools", []))
 
+    # 5.8.3 边界:如果父没传任何有效 toolset(parent_tool_names 空)
+    # ---------------------------------------------------------------------------
+    # 这种情况理论上不会出现(父至少有个 default toolset),但兜底:
+    # 直接返原 set,别做无意义的"subset 检查"
     if not parent_tool_names:
         return set(parent_toolsets)
 
+    # 5.8.4 第二步:扫描 TOOLSETS 全表,看哪些"具名 toolset"是父 tool 集合的子集
+    # ---------------------------------------------------------------------------
+    # 起点 = 父的原 toolset 集合(composite 名也保留,后面 set 相交要用)
+    # expanded = {"hermes-cli"}
     expanded = set(parent_toolsets)
+    # 遍历 TOOLSETS 所有条目
     for ts_name, ts_def in TOOLSETS.items():
+        # 5.8.4.1 已经在 expanded 里了(composite 或之前已加) → 跳过
         if ts_name in expanded:
             continue
+        # 5.8.4.2 拿这个 toolset 自己的 tool 列表
         ts_tools = ts_def.get("tools", [])
+        # 5.8.4.3 关键判断:这个 toolset 的 tool 是不是父 tool 集合的 **子集**?
+        # 例:"terminal" 的 tools = {"shell", "run_command", "send_input"}
+        #     "shell" ∈ parent_tool_names(父有)
+        #     "run_command" ∈ parent_tool_names(父有)
+        #     "send_input" ∈ parent_tool_names(父有)
+        # → 全部包含 → 是 subset → 把 "terminal" 加进 expanded
         if ts_tools and set(ts_tools).issubset(parent_tool_names):
             expanded.add(ts_name)
+    # 5.8.5 返回结果
+    # ---------------------------------------------------------------------------
+    # expanded = {"hermes-cli", "terminal", "file", "web", ...}
+    # 之后在 9.4 求 {"terminal"} & expanded → {"terminal"} ✓
+    # ===========================================================================
     return expanded
 
 

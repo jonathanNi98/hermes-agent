@@ -1,8 +1,24 @@
+#!/usr/bin/env python3
 """
-Cron job management tools for Hermes Agent.
-
-Expose a single compressed action-oriented tool to avoid schema/context bloat.
-Compatibility wrappers remain for direct Python callers and legacy tests.
+# ============================================================
+# Cron Job Tools —— 给 LLM 用的 cron job 管理 tool
+# ============================================================
+# 1.1 本文件做什么
+# ------------------------------------------------------------
+#   暴露一个"压缩"的 action-oriented tool 给 LLM:cronjob(action="...")。
+#   不暴露 N 个独立 tool(create / list / pause / resume / ...)—
+#   那会让 schema/context 太胖。
+#   一个 tool 用 action 字段分派,跟 CLI `hermes cronjob <verb>` 对齐。
+#
+# 1.2 文件组织
+# ------------------------------------------------------------
+#   1.x 模块头 + emoji / unicode 安全 helpers
+#   2.x prompt 注入检测(_scan_cron_prompt / _scan_cron_skill_assembled)
+#   3.x 字段规整(_origin_from_env / _repeat_display / _canonical_skills / _resolve_model_override / _normalize_*)
+#   4.x 路径校验 + 输出格式化(_validate_cron_script_path / _format_job)
+#   5.x 核心:cronjob() —— 单 tool 多 action 的分派器
+#   6.x 注册 + 兼容性 wrapper
+# ============================================================
 """
 
 import json
@@ -122,6 +138,14 @@ _EMOJI_NEIGHBOUR_CP_RANGES = (
 _VARIATION_SELECTOR_CP = 0xFE0F
 
 
+# ===========================================================================
+# 1.x Emoji / Unicode 安全 helpers
+# ===========================================================================
+# 1.1 _is_emoji_cp / _zwj_has_emoji_neighbour / _strip_legitimate_emoji_zwj
+# ---------------------------------------------------------------------------
+# 检测 emoji 码点 / ZWJ(zero-width joiner)序列,
+# 用于从 prompt 里把"合法 emoji"剥离出来(避免注入检测误伤)
+# 例:👨‍👩‍👧‍👦 这种 ZWJ 序列要保留,不能 strip
 def _is_emoji_cp(cp: int) -> bool:
     return any(lo <= cp <= hi for lo, hi in _EMOJI_NEIGHBOUR_CP_RANGES)
 

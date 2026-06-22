@@ -1,11 +1,31 @@
+#!/usr/bin/env python3
 """
-Cron job scheduler - executes due jobs.
-
-Provides tick() which checks for due jobs and runs them. The gateway
-calls this every 60 seconds from a background thread.
-
-Uses a file-based lock (~/.hermes/cron/.tick.lock) so only one tick
-runs at a time if multiple processes overlap.
+# ============================================================
+# Cron Scheduler —— 执行 due jobs 的调度引擎
+# ============================================================
+# 1.1 本文件做什么
+# ------------------------------------------------------------
+#   提供 tick():扫描"现在该跑"的 jobs 并执行。
+#   gateway 每 60s 从后台线程调一次 tick()(典型用法)。
+#
+# 1.2 关键设计
+# ------------------------------------------------------------
+#   - 文件级锁(~/.hermes/cron/.tick.lock)防多 process 重叠
+#     (fcntl on Unix / msvcrt on Windows,都不在则 best-effort)
+#   - tick() 拿锁 → 找 due jobs → 逐个跑 → 释放锁
+#   - 单个 job 跑用 ThreadPoolExecutor(并发上限 N)
+#   - 跑完 mark_job_run + advance_next_run
+#
+# 1.3 文件组织
+# ------------------------------------------------------------
+#   1.x 模块头 + 异常类 + toolset 解析
+#   2.x 文件锁 + profile / 路径 helpers
+#   3.x 投递 / 路由(_resolve_delivery_targets / _send_media_via_adapter / _deliver_result)
+#   4.x 脚本与超时(_get_script_timeout / _run_job_script / _parse_wake_gate)
+#   5.x prompt 构建 + 注入检测(_build_job_prompt / _scan_assembled_cron_prompt)
+#   6.x 核心:run_job + _run_job_impl
+#   7.x tick()(顶层调度循环)
+# ============================================================
 """
 
 import asyncio
@@ -44,6 +64,13 @@ from hermes_time import now as _hermes_now
 logger = logging.getLogger(__name__)
 
 
+# ===========================================================================
+# 1.x 异常类 + toolset 解析
+# ===========================================================================
+# 1.1 CronPromptInjectionBlocked —— prompt 注入检测抛出的异常
+# ---------------------------------------------------------------------------
+# 当 _scan_assembled_cron_prompt 检测到 prompt 含可疑注入模式,
+# 直接 raise 这个异常,阻止 cron job 跑
 class CronPromptInjectionBlocked(Exception):
     """Raised by _build_job_prompt when the fully-assembled prompt trips the
     injection scanner. Caught in run_job so the operator sees a clean
@@ -57,6 +84,12 @@ class CronPromptInjectionBlocked(Exception):
     """
 
 
+# 1.2 _resolve_cron_disabled_toolsets / _resolve_cron_enabled_toolsets
+# ---------------------------------------------------------------------------
+# 从 config 里解析 cron job 默认禁用 / 启用的 toolset
+# job 里 enabled_toolsets 显式指定 → 优先用 job 的
+# 否则:default_disabled - default_enabled = 实际可用
+# 用途:cron job 不应该能调 cron 自己的 toolset(防止 cron 嵌套)
 def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
     """Toolsets a cron-spawned agent must never receive.
 
@@ -158,6 +191,14 @@ SILENT_MARKER = "[SILENT]"
 _hermes_home: Path | None = None
 
 
+# ===========================================================================
+# 2.x 文件锁 + profile / 路径 helpers
+# ===========================================================================
+# 2.1 _get_hermes_home / _get_lock_paths —— 路径解析
+# ---------------------------------------------------------------------------
+# _get_hermes_home:hermes 根目录
+# _get_lock_paths:返 (lock_dir, lock_file) —— tick 用文件锁
+# 锁路径在 ~/.hermes/cron/.tick.lock,跨 process 共享
 def _get_hermes_home() -> Path:
     """Resolve Hermes home dynamically while preserving test monkeypatch hooks."""
     return _hermes_home or get_hermes_home()
@@ -171,6 +212,11 @@ def _get_lock_paths() -> tuple[Path, Path]:
 
 
 @contextmanager
+# 2.2 _job_profile_context / _resolve_origin / _cron_job_origin_log_suffix
+# ---------------------------------------------------------------------------
+# 解析 cron job 跑时的 profile + origin 上下文(用于日志 / 追踪)
+# origin:哪个 caller 创建的这个 job(CLI / API / Telegram / ...)
+# 后缀:写日志时拼到 job name 后,便于审计
 def _job_profile_context(job_id: str, profile: Optional[str]):
     """Temporarily run a job under a specific Hermes profile.
 
@@ -281,6 +327,13 @@ def _cron_job_origin_log_suffix(job: dict) -> str:
     return " " + " ".join(fields) if fields else ""
 
 
+# 2.3 _plugin_cron_env_var / _is_known_delivery_platform / 投递 helpers
+# ---------------------------------------------------------------------------
+# 给 plugin(platform adapter)提供 cron 投递支持
+# _plugin_cron_env_var:platform → 对应的环境变量名
+# _is_known_delivery_platform:platform 是否是已知可投递的(telegram/discord/...)
+# _resolve_home_env_var / _get_home_target_*_id:home 投递的目标解析
+# 用途:cron job 跑完结果按 `deliver` 字段推到指定 platform
 def _plugin_cron_env_var(platform_name: str) -> str:
     """Return the cron home-channel env var registered by a plugin platform.
 
@@ -383,6 +436,16 @@ def _iter_home_target_platforms():
         pass
 
 
+# ===========================================================================
+# 3.x 投递 / 路由
+# ===========================================================================
+# 3.1 _iter_home_target_platforms / _resolve_single_delivery_target
+# ---------------------------------------------------------------------------
+# 把 cron job 的 deliver 字段解析成具体的投递目标列表
+# 支持:
+#   - "home" / "default" / "self" → 推给 home(target platform + chat id)
+#   - "platform:target" 形式(如 "telegram:123456")→ 推给那个 chat
+# 返 list of dict:每个 dict 包含 platform / chat_id / thread_id
 def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[dict]:
     """Resolve one concrete auto-delivery target for a cron job."""
 
@@ -559,6 +622,12 @@ _VIDEO_EXTS = frozenset({'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'})
 _IMAGE_EXTS = frozenset({'.jpg', '.jpeg', '.png', '.webp', '.gif'})
 
 
+# 3.2 _send_media_via_adapter / _deliver_result —— 真正投递结果
+# ---------------------------------------------------------------------------
+# 把 cron job 的输出 markdown 推到目标 platform
+# 支持:文本 / 图片 / 文件附件(各自走不同的 adapter API)
+# 投递失败 → 记 last_delivery_error(不影响 job 的 success 状态)
+# 投递成功 → 返目标 ID(消息 ID / 文件 ID)
 def _send_media_via_adapter(
     adapter,
     chat_id: str,
@@ -815,6 +884,13 @@ _DEFAULT_SCRIPT_TIMEOUT = 120  # seconds
 _SCRIPT_TIMEOUT = _DEFAULT_SCRIPT_TIMEOUT
 
 
+# ===========================================================================
+# 4.x 脚本与超时
+# ===========================================================================
+# 4.1 _get_script_timeout —— 读 cron.script_timeout_seconds 配置
+# ---------------------------------------------------------------------------
+# 默认 600s(10 分钟),硬上限防止脚本 hang 死整个 tick
+# 可以被单个 job 覆盖
 def _get_script_timeout() -> int:
     """Resolve cron pre-run script timeout from module/env/config with a safe default."""
     if _SCRIPT_TIMEOUT != _DEFAULT_SCRIPT_TIMEOUT:
@@ -848,6 +924,14 @@ def _get_script_timeout() -> int:
     return _DEFAULT_SCRIPT_TIMEOUT
 
 
+# 4.2 _run_job_script —— 用 subprocess 跑 job 的前置/后置脚本
+# ---------------------------------------------------------------------------
+# 返 (success: bool, output: str)
+# 关键:
+#   - timeout = _get_script_timeout()
+#   - cwd 强制设到 hermes home(防 job 改 workdir 影响)
+#   - 环境变量包含 HERMES_CRON_JOB_ID / HOME 等
+#   - 输出 capture 回来给 _parse_wake_gate 用
 def _run_job_script(script_path: str) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
@@ -975,6 +1059,11 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         return False, f"Script execution failed: {exc}"
 
 
+# 4.3 _parse_wake_gate —— 解析"wake gate"信号(决定要不要真跑 agent)
+# ---------------------------------------------------------------------------
+# 一些 job 有"前置脚本",输出包含特定标记(如 "WAKE=ok")才继续跑 agent
+# 没标记 → skip agent run(只跑前置脚本)
+# 节省 LLM 资源
 def _parse_wake_gate(script_output: str) -> bool:
     """Parse the last non-empty stdout line of a cron job's pre-check script
     as a wake gate.
@@ -1001,6 +1090,19 @@ def _parse_wake_gate(script_output: str) -> bool:
     return gate.get("wakeAgent", True) is not False
 
 
+# ===========================================================================
+# 5.x prompt 构建 + 注入检测
+# ===========================================================================
+# 5.1 _build_job_prompt —— 拼 cron job 的 system prompt
+# ---------------------------------------------------------------------------
+# 输入:job dict + 可选的 prerun_script 输出
+# 输出:完整的 prompt 字符串(给 LLM 看的 system message)
+# 包含:
+#   - 任务描述
+#   - skill 提示
+#   - 工作目录 / profile 提示
+#   - prerun script 输出(有的话)
+#   - 投递目标(如果有 deliver 字段,告诉 agent 结果推哪)
 def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     """Build the effective prompt for a cron job, optionally loading one or more skills first.
 
@@ -1162,6 +1264,14 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     return _scan_assembled_cron_prompt("\n".join(parts), job, has_skills=True)
 
 
+# 5.2 _scan_assembled_cron_prompt —— prompt 注入检测
+# ---------------------------------------------------------------------------
+# 关键安全防线:扫拼好的 prompt,检查有没有可疑模式
+#   - "ignore previous instructions"
+#   - "system:" 伪 system 消息
+#   - 其他已知注入 pattern
+# 命中 → raise CronPromptInjectionBlocked(阻止 job 跑)
+# 这层防的是 job 自己 prompt 里被人塞了恶意指令(防 LLM 被劫持)
 def _scan_assembled_cron_prompt(assembled: str, job: dict, *, has_skills: bool = False) -> str:
     """Scan the fully-assembled cron prompt for injection patterns. Raises
     ``CronPromptInjectionBlocked`` when a match fires so ``run_job`` can
@@ -1201,6 +1311,17 @@ def _scan_assembled_cron_prompt(assembled: str, job: dict, *, has_skills: bool =
     return assembled
 
 
+# ===========================================================================
+# 6.x 核心:run_job / _run_job_impl —— 跑一个 job 的完整流程
+# ===========================================================================
+# 6.0 run_job —— public 入口(被 tick() / trigger_job 调)
+# ---------------------------------------------------------------------------
+# 返 (success, output, error, delivered_to)
+#   - success:agent 是否成功跑完
+#   - output:markdown 形式的结果(给投递 / 给输出文件用)
+#   - error:失败时的错误消息
+#   - delivered_to:成功投递时的目标 ID(message id / file id)
+# 委托给 _run_job_impl 实现
 def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     """Execute a single cron job, applying any per-job profile override."""
     job_id = job["id"]
@@ -1208,6 +1329,24 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         return _run_job_impl(job)
 
 
+# 6.1 _run_job_impl —— 跑 job 的完整 12 步流程
+# ---------------------------------------------------------------------------
+# 1) 拿 profile context
+# 2) 跑前置脚本(如果有)→ 检查 wake_gate
+# 3) wake_gate 不通过 → skip agent run(只记前置脚本结果)
+# 4) 构建 prompt → _scan_assembled_cron_prompt 检查注入
+# 5) 加载 skill(如果有)→ 加到 system prompt
+# 6) 准备工具集(根据 job config + cron 默认禁用)
+# 7) 调 AIAgent.run() 跑实际 agent(异步)
+# 8) agent 完成 → 拿 final_response
+# 9) save_job_output 写 markdown 文件
+# 10) 投递到 deliver 目标(如果有)
+# 11) mark_job_run + advance_next_run(更新 last_run / next_run_at)
+# 12) 返 (success, output, error, delivered_to)
+#
+# 异常处理:
+#   - prompt 注入 → raise(让 caller 知道)
+#   - 其他异常 → 捕获返 (False, "", error_msg, None)
 def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -1854,6 +1993,31 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             logger.debug("Job '%s': failed to reap stale auxiliary clients: %s", job_id, e)
 
 
+# ===========================================================================
+# 7. tick() —— 顶层调度循环(gateway 每 60s 调一次)
+# ===========================================================================
+# 7.1 tick 流程
+# ---------------------------------------------------------------------------
+# 1) 拿文件级锁(防多 process 同时跑)
+# 2) get_due_jobs 找出"现在该跑"的 job
+# 3) ThreadPoolExecutor 并发跑(并发上限由 config 决定)
+# 4) 每个 job 调 run_job(),记 success / error
+# 5) 跑完 mark_job_run + advance_next_run
+# 6) 释放锁
+# 7) 返跑了几个 job(int)
+#
+# 7.2 为什么用文件锁而不是 threading.Lock
+# ---------------------------------------------------------------------------
+# - threading.Lock 只能保护单 process 内
+# - 文件锁(~/.hermes/cron/.tick.lock)跨 process 也只有一个人能跑
+# - 防止"两个 hermes process 同时 tick"(比如 cron + gateway 同时)
+# - fcntl on Unix / msvcrt on Windows,都不在 best-effort 不锁
+#
+# 7.3 并发跑 vs 串行跑
+# ---------------------------------------------------------------------------
+# 默认串行(简单可靠)
+# 配 max_concurrent > 1 → ThreadPoolExecutor 并发
+# 并发的好处:多个 cron job 不会相互延迟(比如 1 个跑 5 分钟,其他不卡)
 def tick(verbose: bool = True, adapters=None, loop=None) -> int:
     """
     Check and run all due jobs.

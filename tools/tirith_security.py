@@ -693,6 +693,9 @@ _MAX_FINDINGS = 50
 _MAX_SUMMARY_LEN = 500
 
 
+# 扫一条命令:把命令扔给 tirith 二进制跑,根据退出码返回 allow/block/warn。
+# 退出码是真相(0=allow, 1=block, 2=warn),JSON 只能补充 findings/summary,
+# 不会覆盖退出码的判断。子进程崩了/超时/未知退出码,按 fail_open 配置走。
 def check_command_security(command: str) -> dict:
     """Run tirith security scan on a command.
 
